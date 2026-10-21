@@ -945,7 +945,8 @@ from ingestion.mapper import DatasetIngester
 
 def csv_bytes(rows: list[str]) -> bytes:
     header = ",".join(STYLE_A_HEADERS) + "\n"
-    return (header + "\n".join(rows) + "\n").encode("utf-8")
+    body = "\n".join(rows)
+    return (header + body + ("\n" if body else "")).encode("utf-8")
 
 
 def style_a_xlsx(header: list[str], rows: list[list[object]]) -> bytes:
@@ -1070,7 +1071,8 @@ class TestIngestHappyPath:
 
 def complaint_csv_bytes(rows: list[str]) -> bytes:
     header = ",".join(COMPLAINT_HEADERS) + "\n"
-    return (header + "\n".join(rows) + "\n").encode("utf-8")
+    body = "\n".join(rows)
+    return (header + body + ("\n" if body else "")).encode("utf-8")
 
 
 def account_xlsx_bytes(rows: list[list[object]]) -> bytes:

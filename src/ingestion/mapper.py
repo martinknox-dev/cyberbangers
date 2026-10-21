@@ -23,6 +23,7 @@ from core.contracts import (
     COMPLAINT_COLUMNS,
     COMPLAINT_SCHEMA,
     IFSC_PATTERN,
+    MANDATORY_BY_TABLE,
     TRANSACTION_COLUMNS,
     TRANSACTION_SCHEMA,
     ColumnMapping,
@@ -448,6 +449,91 @@ def _normalize(
     return work.with_columns(canonical_steps)
 
 
+TABLE_DEDUPE: Final[dict[TableKind, tuple[str, str]]] = {
+    "transactions": ("_raw_txn_id", "duplicate_utr"),
+    "complaints": ("_raw_ack_no", "duplicate_ack_no"),
+    "accounts": ("_raw_account_no", "duplicate_account_no"),
+}
+
+
+def _validation_reason(work: pl.DataFrame, table: TableKind) -> pl.Expr:
+    """First-match-wins rejection reason over a fixed priority order
+    (Decision 4): missing fields first, then table-specific value rules.
+    Primary-key duplicates are handled separately after field rules
+    (Decisions 5 and 12), keyed per table by TABLE_DEDUPE.
+    """
+    missing = [
+        pl.when(pl.col(f"_raw_{canonical}").is_null())
+        .then(pl.lit(f"missing:{canonical}"))
+        for canonical in MANDATORY_BY_TABLE[table]
+    ]
+    rules: list[pl.Expr] = []
+    if table == "transactions":
+        rules.append(
+            pl.when(pl.col("_raw_amount").is_not_null() & pl.col("amount").is_null())
+            .then(pl.lit("unparseable_amount"))
+        )
+        rules.append(
+            pl.when(pl.col("amount").is_not_null() & (pl.col("amount") < 0))
+            .then(pl.lit("negative_amount"))
+        )
+        rules.append(
+            pl.when(pl.col("_raw_timestamp").is_not_null() & pl.col("timestamp").is_null())
+            .then(pl.lit("unparseable_timestamp"))
+        )
+        rules.append(
+            pl.when(
+                (pl.col("_raw_sender_ifsc").is_not_null() & pl.col("sender_ifsc").is_null())
+                | (pl.col("_raw_receiver_ifsc").is_not_null() & pl.col("receiver_ifsc").is_null())
+            ).then(pl.lit("invalid_ifsc"))
+        )
+        rules.append(
+            pl.when(pl.col("_raw_payment_mode").is_not_null() & pl.col("payment_mode").is_null())
+            .then(pl.lit("unsupported_payment_mode"))
+        )
+    elif table == "complaints":
+        rules.append(
+            pl.when(
+                pl.col("_raw_disputed_amount").is_not_null()
+                & pl.col("disputed_amount").is_null()
+            ).then(pl.lit("unparseable_amount"))
+        )
+        rules.append(
+            pl.when(
+                pl.col("disputed_amount").is_not_null() & (pl.col("disputed_amount") < 0)
+            ).then(pl.lit("negative_amount"))
+        )
+        rules.append(
+            pl.when(
+                pl.col("_raw_reported_timestamp").is_not_null()
+                & pl.col("reported_timestamp").is_null()
+            ).then(pl.lit("unparseable_timestamp"))
+        )
+    else:
+        rules.append(
+            pl.when(pl.col("_raw_ifsc").is_not_null() & pl.col("ifsc").is_null())
+            .then(pl.lit("invalid_ifsc"))
+        )
+        rules.append(
+            pl.when(
+                pl.col("_raw_account_type").is_not_null() & pl.col("account_type").is_null()
+            ).then(pl.lit("unsupported_account_type"))
+        )
+        rules.append(
+            pl.when(pl.col("_raw_mobile_no").is_not_null() & pl.col("mobile_no").is_null())
+            .then(pl.lit("invalid_mobile_no"))
+        )
+        rules.append(
+            pl.when(pl.col("_raw_imei").is_not_null() & pl.col("imei").is_null())
+            .then(pl.lit("invalid_imei"))
+        )
+        rules.append(
+            pl.when(pl.col("_raw_kyc_pincode").is_not_null() & pl.col("kyc_pincode").is_null())
+            .then(pl.lit("invalid_kyc_pincode"))
+        )
+    return pl.coalesce(*missing, *rules)
+
+
 class DatasetIngester:
     """CSV/XLSX ingester with fuzzy headers, validation and audit reporting.
 
@@ -492,27 +578,49 @@ class DatasetIngester:
     def _ingest_frame(
         self, raw: pl.DataFrame, source_label: str | None, table: TableKind
     ) -> tuple[pl.DataFrame, IngestionReport]:
-        """Happy-path: normalize + emit every row as accepted (Task 5 wires rejections)."""
         mapping = map_headers(raw.columns, self.confidence_threshold, table=table)
         work = _normalize(raw, mapping, table)
-        accepted = work.select(
+        work = work.with_columns(
+            _validation_reason(work, table).alias("rejection_reason")
+        )
+
+        audit_col, duplicate_reason = TABLE_DEDUPE[table]
+        bad = work.filter(pl.col("rejection_reason").is_not_null())
+        surviving = work.filter(pl.col("rejection_reason").is_null())
+        surviving = surviving.with_columns(
+            pl.col(audit_col).is_first_distinct().alias("_first_key")
+        )
+        accepted = (
+            surviving.filter(pl.col("_first_key"))
+            .select(
+                [
+                    pl.col(c).cast(TABLE_SCHEMA[table][c], strict=False)
+                    for c in TABLE_COLUMNS[table]
+                ]
+            )
+        )
+        raw_cols = [pl.col(name) for name in raw.columns]
+        duplicates = surviving.filter(~pl.col("_first_key")).select(
+            raw_cols + [pl.lit(duplicate_reason).alias("rejection_reason")]
+        )
+        rejected = pl.concat(
             [
-                pl.col(c).cast(TABLE_SCHEMA[table][c], strict=False)
-                for c in TABLE_COLUMNS[table]
-            ]
+                bad.select(raw_cols + [pl.col("rejection_reason")]),
+                duplicates,
+            ],
+            how="vertical",
         )
-        rejected = pl.DataFrame(
-            schema={
-                name: pl.String()
-                for name in (*[str(c) for c in raw.columns], "rejection_reason")
-            }
-        )
+        counts = rejected.group_by("rejection_reason").len().sort("rejection_reason")
+        failure_counts = {
+            str(row["rejection_reason"]): int(row["len"])
+            for row in counts.to_dicts()
+        }
         report = IngestionReport(
             source=source_label,
             rows_total=raw.height,
             rows_accepted=accepted.height,
-            rows_rejected=0,
-            failure_counts={},
+            rows_rejected=rejected.height,
+            failure_counts=failure_counts,
             column_mapping=mapping,
             rejected_rows=rejected,
         )

@@ -311,7 +311,8 @@ class TestHeaderMapping:
 
 def csv_bytes(rows: list[str]) -> bytes:
     header = ",".join(STYLE_A_HEADERS) + "\n"
-    return (header + "\n".join(rows) + "\n").encode("utf-8")
+    body = "\n".join(rows)
+    return (header + body + ("\n" if body else "")).encode("utf-8")
 
 
 def style_a_xlsx(header: list[str], rows: list[list[object]]) -> bytes:
@@ -495,3 +496,192 @@ class TestIngestMultiTableHappy:
         df, report = DatasetIngester().ingest(str(path))
         assert report.rows_rejected == 0
         assert df["payment_mode"].to_list() == ["RTGS", "ATM", "AEPS", "UPI", "UPI"]
+
+
+class TestIngestRejections:
+    ROW = (
+        "UTR_R1,2900000001,SBIN0001234,2900000002,SBIN0009876,100.00,"
+        "2024-06-01 10:30:00,UPI,D000001,10.0.0.9"
+    )
+
+    def _ingest_rows(self, tmp_path, rows: list[str]):
+        path = tmp_path / "reject.csv"
+        path.write_bytes(csv_bytes(rows))
+        return DatasetIngester().ingest(str(path))
+
+    def test_negative_amount_rejected(self, tmp_path) -> None:
+        df, report = self._ingest_rows(tmp_path, [
+            self.ROW,
+            "UTR_R2,2900000001,SBIN0001234,2900000002,SBIN0009876,-5.00,2024-06-01 10:31:00,UPI,,",
+        ])
+        assert report.rows_total == 2
+        assert report.rows_rejected == 1 and df.height == 1
+        assert report.failure_counts == {"negative_amount": 1}
+        assert report.rejected_rows["UTR"].item() == "UTR_R2"
+        assert report.rejected_rows["rejection_reason"].item() == "negative_amount"
+
+    def test_unparseable_timestamp_rejected(self, tmp_path) -> None:
+        df, report = self._ingest_rows(tmp_path, [
+            "UTR_R3,1,SBIN0000001,2,SBIN0000002,10.00,NOT-A-DATE,UPI,,",
+        ])
+        assert report.failure_counts == {"unparseable_timestamp": 1}
+        assert df.height == 0
+
+    def test_unparseable_amount_rejected(self, tmp_path) -> None:
+        df, report = self._ingest_rows(tmp_path, [
+            "UTR_R4,1,SBIN0000001,2,SBIN0000002,ten,2024-06-01 10:30:00,UPI,,",
+        ])
+        assert report.failure_counts == {"unparseable_amount": 1}
+        assert df.height == 0
+
+    def test_missing_mandatory_fields(self, tmp_path) -> None:
+        rows = [
+            ",1,SBIN0000001,2,SBIN0000002,10,2024-06-01 10:30:00,UPI,,",              # missing:txn_id
+            "UTR_M2,,SBIN0000001,2,SBIN0000002,10,2024-06-01 10:30:00,UPI,,",         # missing:sender_account
+            "UTR_M3,1,SBIN0000001,,SBIN0000002,10,2024-06-01 10:30:00,UPI,,",         # missing:receiver_account
+            "UTR_M4,1,SBIN0000001,2,SBIN0000002,,2024-06-01 10:30:00,UPI,,",          # missing:amount
+            "UTR_M5,1,SBIN0000001,2,SBIN0000002,10,,UPI,,",                            # missing:timestamp
+            "UTR_M6,1,SBIN0000001,2,SBIN0000002,10,2024-06-01 10:30:00,,,1.1.1.1",     # missing:payment_mode
+        ]
+        df, report = self._ingest_rows(tmp_path, rows)
+        assert df.height == 0
+        assert report.rows_rejected == 6
+        assert report.failure_counts == {
+            "missing:txn_id": 1, "missing:sender_account": 1,
+            "missing:receiver_account": 1, "missing:amount": 1,
+            "missing:timestamp": 1, "missing:payment_mode": 1,
+        }
+
+    def test_duplicate_utr_keep_first(self, tmp_path) -> None:
+        df, report = self._ingest_rows(tmp_path, [
+            self.ROW,
+            self.ROW.replace("100.00", "200.00"),
+        ])
+        assert report.failure_counts == {"duplicate_utr": 1}
+        assert df.height == 1 and df["amount"].item() == 100.0
+        assert report.rejected_rows["UTR"].item() == "UTR_R1"
+
+    def test_invalid_ifsc_rejected(self, tmp_path) -> None:
+        df, report = self._ingest_rows(tmp_path, [
+            "UTR_R5,1,SBIN1234,2,SBIN0000002,10,2024-06-01 10:30:00,UPI,,",
+        ])
+        assert report.failure_counts == {"invalid_ifsc": 1}
+        assert df.height == 0
+
+    def test_unsupported_payment_mode_rejected(self, tmp_path) -> None:
+        df, report = self._ingest_rows(tmp_path, [
+            "UTR_R6,1,SBIN0000001,2,SBIN0000002,10,2024-06-01 10:30:00,CHEQUE,,",
+        ])
+        assert report.failure_counts == {"unsupported_payment_mode": 1}
+
+    def test_priority_missing_beats_all(self, tmp_path) -> None:
+        df, report = self._ingest_rows(tmp_path, [
+            "UTR_R7,,SBIN0000001,2,SBIN0000002,-10,NOT-A-DATE,ZZZ,,",
+        ])
+        assert report.failure_counts == {"missing:sender_account": 1}
+
+    def test_mixed_reasons_aggregate(self, tmp_path) -> None:
+        df, report = self._ingest_rows(tmp_path, [
+            "UTR_R8,1,SBIN0000001,2,SBIN0000002,-1,2024-06-01 10:30:00,UPI,,",          # negative_amount
+            "UTR_R9,1,SBIN0000001,2,SBIN0000002,10,NOPE,UPI,,",                          # unparseable_timestamp
+        ])
+        assert report.failure_counts == {"negative_amount": 1, "unparseable_timestamp": 1}
+        assert report.rows_accepted == 0 and df.height == 0
+        assert set(report.rejected_rows.columns) == set(STYLE_A_HEADERS) | {"rejection_reason"}
+
+    def test_zero_amount_accepted(self, tmp_path) -> None:
+        df, report = self._ingest_rows(tmp_path, [
+            "UTR_Z1,1,SBIN0000001,2,SBIN0000002,0,2024-06-01 10:30:00,UPI,,",
+        ])
+        assert report.rows_rejected == 0 and df.height == 1
+        assert df["amount"].item() == 0.0
+
+    def test_header_only_csv_returns_empty_report(self, tmp_path) -> None:
+        df, report = self._ingest_rows(tmp_path, [])
+        assert df.height == 0 and df.width == len(TRANSACTION_COLUMNS)
+        assert report.rows_total == 0 and report.rows_accepted == 0
+        assert report.rows_rejected == 0 and report.failure_counts == {}
+        assert report.column_mapping["UTR"].canonical_name == "txn_id"
+        assert report.rejected_rows.is_empty()
+
+    def test_ragged_csv_rows_do_not_crash(self, tmp_path) -> None:
+        df, report = self._ingest_rows(tmp_path, [
+            self.ROW + ",EXTRA,CELLS",          # reader truncates extras; row parses
+            self.ROW.replace("UTR_R1", "UTR_R10"),
+        ])
+        assert report.rows_total == 2
+        assert report.rows_rejected == 0
+        assert df.height == 2
+
+    def test_quoted_timestamp_cell_still_parses(self, tmp_path) -> None:
+        df, report = self._ingest_rows(tmp_path, [
+            'UTR_CX1,1,SBIN0000001,2,SBIN0000002,10,"2024-06-01 10:30:00",UPI,,',
+        ])
+        assert report.rows_rejected == 0
+        assert df["timestamp"].item() == datetime(2024, 6, 1, 10, 30, 0)
+
+
+class TestIngestMultiTableRejections:
+    def test_complaint_missing_ack_duplicate_ack(self, tmp_path) -> None:
+        rows = [
+            # empty ack -> missing:ack_no (also: suspect + disputed UTR optional, fine)
+            ",2900000007,2990100000,AEPS_CASHOUT,02/06/2024 09:15:00,32000,UTR2024060100001,Bihar",
+            "ACK20240005,2900000008,2990100001,UPI_FRAUD,02/06/2024 10:15:00,1500,UTR2024060100002,Delhi",
+            "ACK20240005,2900000008,2990100001,UPI_FRAUD,02/06/2024 10:20:00,1500,UTR2024060100002,Delhi",  # dup ack
+        ]
+        path = tmp_path / "ncrp_reject.csv"
+        path.write_bytes(complaint_csv_bytes(rows))
+        df, report = DatasetIngester().ingest_complaints(str(path))
+        assert report.rows_total == 3
+        assert df.height == 1
+        assert df["ack_no"].item() == "ACK20240005"
+        assert report.failure_counts == {"duplicate_ack_no": 1, "missing:ack_no": 1}
+        assert report.rejected_rows["rejection_reason"].to_list()[0] == "missing:ack_no"
+
+    def test_complaint_missing_mandatory_field(self, tmp_path) -> None:
+        rows = [
+            # empty state -> missing:state; amount/timestamp fine
+            "ACK20240006,2900000007,2990100002,AEPS_CASHOUT,02/06/2024 09:15:00,9000,UTR2024060100003,",
+        ]
+        path = tmp_path / "ncrp_state.csv"
+        path.write_bytes(complaint_csv_bytes(rows))
+        df, report = DatasetIngester().ingest_complaints(str(path))
+        assert report.failure_counts == {"missing:state": 1}
+        assert df.height == 0
+
+    def test_accounts_rejections(self, tmp_path) -> None:
+        rows = [
+            # ifsc malformed -> invalid_ifsc
+            "2994000000,SBIN00,15/03/2024,BR042,9812000000,351104510900001,800013,CURRENT",
+            # unsupported account type -> unsupported_account_type
+            "2994000001,SBIN0001234,15/03/2024,BR042,9812000001,351104510900002,800013,JOINT",
+            # pincode not digits -> invalid_kyc_pincode
+            "2994000002,SBIN0001234,15/03/2024,BR042,9812000002,351104510900003,12AB56,CURRENT",
+            # mobile too short -> invalid_mobile_no (5 digits)
+            "2994000003,SBIN0001234,15/03/2024,BR042,98123,351104510900004,800013,CURRENT",
+            # clean row -> accepted, plus duplicate account_no below
+            "2994000004,SBIN0001234,2024-03-15,BR042,9812000004,351104510900005,800013,SAVINGS",
+            "2994000004,SBIN0001234,2024-03-20,BR042,9812000005,351104510900006,800013,SAVINGS",  # dup account_no
+        ]
+        path = tmp_path / "accounts_reject.csv"
+        path.write_bytes((",".join(ACCOUNT_HEADERS) + "\n" + "\n".join(rows) + "\n").encode())
+        df, report = DatasetIngester().ingest_accounts(str(path))
+        assert report.rows_total == 6
+        assert report.rows_accepted == 1 and df.height == 1
+        assert df["account_no"].item() == "2994000004"
+        assert df["account_opening_date"].item() == date(2024, 3, 15)   # keep-first
+        assert report.failure_counts == {
+            "duplicate_account_no": 1, "invalid_ifsc": 1, "invalid_kyc_pincode": 1,
+            "invalid_mobile_no": 1, "unsupported_account_type": 1,
+        }
+
+    def test_accounts_missing_mandatory(self, tmp_path) -> None:
+        rows = [
+            # empty branch code -> missing:branch_code
+            "2994000005,SBIN0001234,16/03/2024,,9812000006,351104510900007,800013,CURRENT",
+        ]
+        path = tmp_path / "accounts_missing.csv"
+        path.write_bytes((",".join(ACCOUNT_HEADERS) + "\n" + "\n".join(rows) + "\n").encode())
+        df, report = DatasetIngester().ingest_accounts(str(path))
+        assert report.failure_counts == {"missing:branch_code": 1}
+        assert df.height == 0
