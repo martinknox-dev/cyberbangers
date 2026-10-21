@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import re
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Final
 
@@ -270,6 +271,51 @@ _XLSX_MAGIC: Final[bytes] = b"PK\x03\x04"
 _NUMERIC_RE: Final = re.compile(r"^\d+$")
 _CURRENCY_JUNK_RE: Final = re.compile(r"[,\s\u20b9]")
 
+# Business range for parsed timestamps (and account opening dates): anything
+# outside it is treated as unparseable garbage rather than a real date.
+_TS_MIN: Final[datetime] = datetime(1900, 1, 1)
+_TS_MAX: Final[datetime] = datetime(2100, 1, 1)
+
+# Supported epoch units: seconds (10^9..10^12) and milliseconds (10^12..10^13).
+# Anything else (microseconds, nanoseconds, overflow) is not a timestamp.
+_EPOCH_SECONDS_MIN: Final[int] = 10**9
+_EPOCH_SECONDS_MAX: Final[int] = 10**12
+_EPOCH_MS_MIN: Final[int] = 10**12
+_EPOCH_MS_MAX: Final[int] = 10**13
+
+# Rejection vocabulary per table (auditable contract for the ingest pipeline).
+REJECTION_REASONS: Final[dict[TableKind, tuple[str, ...]]] = {
+    "transactions": tuple(
+        f"missing:{name}" for name in MANDATORY_BY_TABLE["transactions"]
+    ) + (
+        "unparseable_amount",
+        "negative_amount",
+        "unparseable_timestamp",
+        "invalid_ifsc",
+        "unsupported_payment_mode",
+        "duplicate_utr",
+    ),
+    "complaints": tuple(
+        f"missing:{name}" for name in MANDATORY_BY_TABLE["complaints"]
+    ) + (
+        "unparseable_amount",
+        "negative_amount",
+        "unparseable_timestamp",
+        "duplicate_ack_no",
+    ),
+    "accounts": tuple(
+        f"missing:{name}" for name in MANDATORY_BY_TABLE["accounts"]
+    ) + (
+        "invalid_ifsc",
+        "invalid_account_opening_date",
+        "unsupported_account_type",
+        "invalid_mobile_no",
+        "invalid_imei",
+        "invalid_kyc_pincode",
+        "duplicate_account_no",
+    ),
+}
+
 
 def _looks_like_xlsx(source: str | Path | bytes) -> bool:
     if isinstance(source, (bytes, bytearray)):
@@ -289,20 +335,52 @@ def _read_csv(source: str | Path | bytes) -> pl.DataFrame:
         data: str | io.BytesIO = io.BytesIO(bytes(source))
     else:
         data = str(source)
-    return pl.read_csv(
-        data,
-        infer_schema_length=0,
-        truncate_ragged_lines=True,
-        quote_char='"',
-    )
+    try:
+        return pl.read_csv(
+            data,
+            infer_schema_length=0,
+            truncate_ragged_lines=True,
+            quote_char='"',
+        )
+    except pl.exceptions.NoDataError:
+        # Empty (or header-less) file: an empty frame, never a crash.
+        return pl.DataFrame()
+
+
+def _xlsx_headers(source: str | Path | bytes) -> list[str]:
+    """First-row headers of the first worksheet (fallback for empty sheets)."""
+    import openpyxl
+
+    handle: str | io.BytesIO
+    if isinstance(source, (bytes, bytearray)):
+        handle = io.BytesIO(bytes(source))
+    else:
+        handle = str(source)
+    workbook = openpyxl.load_workbook(handle, read_only=True, data_only=True)
+    try:
+        sheets = workbook.worksheets
+        if not sheets:
+            return []
+        row = next(sheets[0].iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if row is None:
+            return []
+        return [str(cell) for cell in row if cell is not None]
+    finally:
+        workbook.close()
 
 
 def _read_xlsx(source: str | Path | bytes) -> pl.DataFrame:
     """First worksheet; every cell coerced to String for the unified pipeline."""
-    if isinstance(source, (bytes, bytearray)):
-        df = pl.read_excel(io.BytesIO(bytes(source)), engine="openpyxl")
-    else:
-        df = pl.read_excel(str(source), engine="openpyxl")
+    try:
+        if isinstance(source, (bytes, bytearray)):
+            df = pl.read_excel(io.BytesIO(bytes(source)), engine="openpyxl")
+        else:
+            df = pl.read_excel(str(source), engine="openpyxl")
+    except pl.exceptions.NoDataError:
+        # Header-only or empty sheet: rebuild the header list from the file so
+        # the caller still gets a zero-row frame with the source's columns.
+        headers = _xlsx_headers(source)
+        return pl.DataFrame(schema={name: pl.String() for name in headers})
     return df.select(
         [pl.col(name).cast(pl.String, strict=False).alias(name) for name in df.columns]
     )
@@ -317,27 +395,46 @@ def _canonical_raw(mapping: dict[str, ColumnMapping], canonical: str) -> str | N
 
 
 def _epoch_expr(src: pl.Expr) -> pl.Expr:
-    """UNIX seconds/milliseconds detection for purely numeric timestamps."""
+    """UNIX seconds/milliseconds detection for purely numeric timestamps.
+
+    Only two units are supported (seconds, milliseconds) and only inside their
+    own magnitude window: a 15- or 16-digit value is not a timestamp, and must
+    never reach `from_epoch` (which panics for out-of-range years).
+    """
     digits = pl.when(src.str.contains(_NUMERIC_RE.pattern)).then(src).otherwise(None)
     as_int = digits.cast(pl.Int64, strict=False)
+    # Clamp before conversion: `from_epoch` panics on unrepresentable years,
+    # and the clamped value is discarded by the branch predicate anyway.
+    safe = as_int.fill_null(0)
+    safe_s = pl.min_horizontal(safe, pl.lit(_EPOCH_SECONDS_MAX - 1, dtype=pl.Int64))
+    safe_ms = pl.min_horizontal(safe, pl.lit(_EPOCH_MS_MAX - 1, dtype=pl.Int64))
     return (
-        pl.when(as_int >= 10**12)
-        .then(pl.from_epoch(as_int, time_unit="ms"))
-        .when(as_int >= 10**9)
-        .then(pl.from_epoch(as_int, time_unit="s"))
+        pl.when((as_int >= _EPOCH_SECONDS_MIN) & (as_int < _EPOCH_SECONDS_MAX))
+        .then(pl.from_epoch(safe_s, time_unit="s"))
+        .when((as_int >= _EPOCH_MS_MIN) & (as_int < _EPOCH_MS_MAX))
+        .then(pl.from_epoch(safe_ms, time_unit="ms"))
         .otherwise(None)
     )
 
 
 def _timestamp_expr(src: pl.Expr) -> pl.Expr:
-    """Epoch first, then DD/MM-before-MM/DD format fallbacks (task Decision 2)."""
+    """Epoch first, then DD/MM-before-MM/DD format fallbacks (task Decision 2).
+
+    Parsed values outside the business range (1900-01-01 .. 2100-01-01) are
+    treated as unparseable rather than as real, absurd dates.
+    """
     fallback = pl.coalesce(
         *[
             src.str.strptime(pl.Datetime("us"), fmt, strict=False)
             for fmt in TS_FORMATS
         ]
     )
-    return pl.coalesce(_epoch_expr(src), fallback)
+    parsed = pl.coalesce(_epoch_expr(src), fallback)
+    return (
+        pl.when((parsed >= _TS_MIN) & (parsed <= _TS_MAX))
+        .then(parsed)
+        .otherwise(None)
+    )
 
 
 def _amount_expr(src: pl.Expr) -> pl.Expr:
@@ -470,8 +567,10 @@ def _validation_reason(work: pl.DataFrame, table: TableKind) -> pl.Expr:
     rules: list[pl.Expr] = []
     if table == "transactions":
         rules.append(
-            pl.when(pl.col("_raw_amount").is_not_null() & pl.col("amount").is_null())
-            .then(pl.lit("unparseable_amount"))
+            pl.when(
+                pl.col("_raw_amount").is_not_null()
+                & (pl.col("amount").is_null() | ~pl.col("amount").is_finite())
+            ).then(pl.lit("unparseable_amount"))
         )
         rules.append(
             pl.when(pl.col("amount").is_not_null() & (pl.col("amount") < 0))
@@ -495,7 +594,10 @@ def _validation_reason(work: pl.DataFrame, table: TableKind) -> pl.Expr:
         rules.append(
             pl.when(
                 pl.col("_raw_disputed_amount").is_not_null()
-                & pl.col("disputed_amount").is_null()
+                & (
+                    pl.col("disputed_amount").is_null()
+                    | ~pl.col("disputed_amount").is_finite()
+                )
             ).then(pl.lit("unparseable_amount"))
         )
         rules.append(
@@ -513,6 +615,12 @@ def _validation_reason(work: pl.DataFrame, table: TableKind) -> pl.Expr:
         rules.append(
             pl.when(pl.col("_raw_ifsc").is_not_null() & pl.col("ifsc").is_null())
             .then(pl.lit("invalid_ifsc"))
+        )
+        rules.append(
+            pl.when(
+                pl.col("_raw_account_opening_date").is_not_null()
+                & pl.col("account_opening_date").is_null()
+            ).then(pl.lit("invalid_account_opening_date"))
         )
         rules.append(
             pl.when(
@@ -579,14 +687,44 @@ class DatasetIngester:
         self, raw: pl.DataFrame, source_label: str | None, table: TableKind
     ) -> tuple[pl.DataFrame, IngestionReport]:
         mapping = map_headers(raw.columns, self.confidence_threshold, table=table)
+        if raw.height == 0:
+            # Empty/header-only source: a conforming empty frame, zeroed report.
+            accepted = pl.DataFrame(
+                schema={name: TABLE_SCHEMA[table][name] for name in TABLE_COLUMNS[table]}
+            )
+            rejected = pl.DataFrame(
+                schema={name: pl.String() for name in (*raw.columns, "rejection_reason")}
+            )
+            report = IngestionReport(
+                source=source_label,
+                rows_total=0,
+                rows_accepted=0,
+                rows_rejected=0,
+                failure_counts={},
+                column_mapping=mapping,
+                rejected_rows=rejected,
+            )
+            return accepted, report
+
         work = _normalize(raw, mapping, table)
         work = work.with_columns(
-            _validation_reason(work, table).alias("rejection_reason")
+            _validation_reason(work, table).alias("__rejection_reason")
         )
 
         audit_col, duplicate_reason = TABLE_DEDUPE[table]
-        bad = work.filter(pl.col("rejection_reason").is_not_null())
-        surviving = work.filter(pl.col("rejection_reason").is_null())
+        # A key is "first" only among rows that passed the field rules: a
+        # rejected row must not consume the first slot of its key.
+        effective_key = pl.when(pl.col("__rejection_reason").is_null()).then(
+            pl.col(audit_col)
+        ).otherwise(None)
+        work = work.with_columns(effective_key.alias("__effective_key"))
+        rejected_mask = work["__rejection_reason"].is_not_null()
+        duplicate_mask = (
+            work["__rejection_reason"].is_null()
+            & ~work["__effective_key"].is_first_distinct()
+        )
+
+        surviving = work.filter(pl.col("__rejection_reason").is_null())
         surviving = surviving.with_columns(
             pl.col(audit_col).is_first_distinct().alias("_first_key")
         )
@@ -599,14 +737,21 @@ class DatasetIngester:
                 ]
             )
         )
-        raw_cols = [pl.col(name) for name in raw.columns]
-        duplicates = surviving.filter(~pl.col("_first_key")).select(
-            raw_cols + [pl.lit(duplicate_reason).alias("rejection_reason")]
+
+        # The audit frame is built from the pristine source frame, so a rejected
+        # row always shows the original header names and the original text.
+        raw_source = raw
+        if "rejection_reason" in raw_source.columns:
+            raw_source = raw_source.rename({"rejection_reason": "rejection_reason_source"})
+        audit = raw_source.with_columns(
+            work["__rejection_reason"].alias("rejection_reason")
         )
         rejected = pl.concat(
             [
-                bad.select(raw_cols + [pl.col("rejection_reason")]),
-                duplicates,
+                audit.filter(rejected_mask),
+                audit.filter(duplicate_mask).with_columns(
+                    pl.lit(duplicate_reason).alias("rejection_reason")
+                ),
             ],
             how="vertical",
         )

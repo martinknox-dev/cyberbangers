@@ -945,3 +945,206 @@ class TestComplaints:
             SCHEME_FAN_OUT_SMURFING: 5,
             SCHEME_AEPS_TERMINAL_CASH_OUT: 3,
         }
+
+
+CANONICAL_HEADER = (
+    "txn_id,sender_account,sender_ifsc,receiver_account,receiver_ifsc,"
+    "amount,timestamp,payment_mode,device_id,ip_address\n"
+)
+CANONICAL_ROW = (
+    "UTR_Q1,2900000001,SBIN0001234,2900000002,SBIN0009876,100.00,"
+    "2024-06-01 10:30:00,UPI,D000001,10.0.0.9"
+)
+
+
+class TestHostileInputs:
+    """No input may crash the ingester; every bad row carries one reason."""
+
+    def _csv(self, tmp_path, header: str, rows: list[str], name: str = "h.csv"):
+        path = tmp_path / name
+        path.write_bytes((header + "\n".join(rows) + ("\n" if rows else "")).encode())
+        return path
+
+    def test_out_of_range_epoch_rejected_not_panicking(self, tmp_path) -> None:
+        # 15-digit (microsecond-ish) and 16-digit epochs are not supported
+        # units: they must be rejected, never materialised as year 7411/56385.
+        for value in ("171720000000000", "1717200000000000"):
+            path = self._csv(
+                tmp_path,
+                ",".join(STYLE_A_HEADERS) + "\n",
+                [f"UTR_E,1,SBIN0000001,2,SBIN0000002,10,{value},UPI,,"],
+                "epoch.csv",
+            )
+            df, report = DatasetIngester().ingest(str(path))
+            assert report.rows_accepted == 0, value
+            assert report.failure_counts == {"unparseable_timestamp": 1}, value
+            assert df.height == 0
+
+    def test_supported_epoch_units_still_accepted(self, tmp_path) -> None:
+        path = self._csv(
+            tmp_path,
+            ",".join(STYLE_A_HEADERS) + "\n",
+            [
+                "UTR_ES,1,SBIN0000001,2,SBIN0000002,10,1717200000,UPI,,",
+                "UTR_EM,1,SBIN0000001,2,SBIN0000002,10,1717200000000,UPI,,",
+            ],
+            "epoch_ok.csv",
+        )
+        df, report = DatasetIngester().ingest(str(path))
+        assert report.rows_rejected == 0
+        assert sorted(df["timestamp"].to_list()) == [
+            datetime(2024, 6, 1, 0, 0, 0), datetime(2024, 6, 1, 0, 0, 0),
+        ]
+
+    def test_non_finite_amounts_rejected(self, tmp_path) -> None:
+        for raw in ("NaN", "inf", "Infinity", "1e400"):
+            path = self._csv(
+                tmp_path,
+                ",".join(STYLE_A_HEADERS) + "\n",
+                [f"UTR_N,1,SBIN0000001,2,SBIN0000002,{raw},2024-06-01 10:30:00,UPI,,"],
+                "nan.csv",
+            )
+            df, report = DatasetIngester().ingest(str(path))
+            assert report.rows_accepted == 0, raw
+            assert report.failure_counts == {"unparseable_amount": 1}, raw
+            assert df.height == 0
+
+    def test_empty_csv_never_raises(self, tmp_path) -> None:
+        path = tmp_path / "empty.csv"
+        path.write_bytes(b"")
+        df, report = DatasetIngester().ingest(str(path))
+        assert df.height == 0 and df.width == len(TRANSACTION_COLUMNS)
+        assert report.rows_total == 0 and report.rows_accepted == 0
+        assert report.rows_rejected == 0 and report.failure_counts == {}
+        assert report.rejected_rows.is_empty()
+
+    def test_whitespace_only_csv_never_raises(self, tmp_path) -> None:
+        path = tmp_path / "blank.csv"
+        path.write_bytes(b"   \n")
+        df, report = DatasetIngester().ingest(str(path))
+        assert df.height == 0 and df.width == len(TRANSACTION_COLUMNS)
+        assert report.rows_total == 0
+
+    def test_header_only_xlsx_never_raises(self) -> None:
+        payload = style_a_xlsx(STYLE_A_HEADERS, [])
+        df, report = DatasetIngester().ingest(payload)
+        assert df.height == 0 and df.width == len(TRANSACTION_COLUMNS)
+        assert report.rows_total == 0 and report.rows_accepted == 0
+        assert report.failure_counts == {}
+        assert report.column_mapping["UTR"].canonical_name == "txn_id"
+
+    def test_completely_empty_xlsx_never_raises(self) -> None:
+        wb = openpyxl.Workbook()
+        buf = io.BytesIO()
+        wb.save(buf)
+        df, report = DatasetIngester().ingest(buf.getvalue())
+        assert df.height == 0 and df.width == len(TRANSACTION_COLUMNS)
+        assert report.rows_total == 0
+
+    def test_audit_preserves_source_text_for_canonical_headers(self, tmp_path) -> None:
+        path = self._csv(
+            tmp_path,
+            CANONICAL_HEADER,
+            [CANONICAL_ROW.replace("100.00", "-5.00")],
+            "canon.csv",
+        )
+        df, report = DatasetIngester().ingest(str(path))
+        assert report.rows_rejected == 1 and df.height == 0
+        rejected = report.rejected_rows
+        # source text, not the normalized/typed value
+        assert rejected["amount"].item() == "-5.00"
+        assert rejected["timestamp"].item() == "2024-06-01 10:30:00"
+        assert rejected["rejection_reason"].item() == "negative_amount"
+        assert rejected.schema["amount"] == pl.String
+
+    def test_source_column_named_rejection_reason_does_not_crash(self, tmp_path) -> None:
+        path = self._csv(
+            tmp_path,
+            ",".join([*STYLE_A_HEADERS, "rejection_reason"]) + "\n",
+            [CANONICAL_ROW.replace("100.00", "-5.00") + ",SOURCE-NOTE"],
+            "reason.csv",
+        )
+        _df, report = DatasetIngester().ingest(str(path))
+        assert report.rows_rejected == 1
+        rejected = report.rejected_rows
+        assert rejected["rejection_reason"].item() == "negative_amount"
+        assert rejected["rejection_reason_source"].item() == "SOURCE-NOTE"
+
+    def test_source_column_named_raw_txn_id_keeps_source_value(self, tmp_path) -> None:
+        path = self._csv(
+            tmp_path,
+            ",".join([*STYLE_A_HEADERS, "_raw_txn_id"]) + "\n",
+            [CANONICAL_ROW.replace("100.00", "-5.00") + ",ZZZ-ORIGINAL"],
+            "rawtxn.csv",
+        )
+        _df, report = DatasetIngester().ingest(str(path))
+        assert report.rows_rejected == 1
+        assert report.rejected_rows["_raw_txn_id"].item() == "ZZZ-ORIGINAL"
+
+    def test_malformed_account_opening_date_rejected(self, tmp_path) -> None:
+        for raw_date in ("NOT-A-DATE", "2024-02-31"):
+            path = self._csv(
+                tmp_path,
+                ",".join(ACCOUNT_HEADERS) + "\n",
+                [f"2994000010,SBIN0001234,{raw_date},BR042,9812000010,351104510900010,800013,CURRENT"],
+                "acct.csv",
+            )
+            _df, report = DatasetIngester().ingest_accounts(str(path))
+            assert report.rows_accepted == 0, raw_date
+            assert report.failure_counts == {"invalid_account_opening_date": 1}, raw_date
+
+    def test_invalid_imei_rejected(self, tmp_path) -> None:
+        path = self._csv(
+            tmp_path,
+            ",".join(ACCOUNT_HEADERS) + "\n",
+            ["2994000011,SBIN0001234,15/03/2024,BR042,9812000011,12345,800013,CURRENT"],
+            "imei.csv",
+        )
+        df, report = DatasetIngester().ingest_accounts(str(path))
+        assert report.failure_counts == {"invalid_imei": 1}
+        assert df.height == 0
+
+    def test_rejection_reason_vocabulary(self) -> None:
+        from ingestion.mapper import REJECTION_REASONS
+
+        for table, reasons in REJECTION_REASONS.items():
+            assert reasons, table
+            assert len(set(reasons)) == len(reasons), table
+
+    def test_rejected_row_does_not_consume_its_dedupe_key(self, tmp_path) -> None:
+        # The bad row comes first and shares the UTR with the good row: the
+        # good row must still be accepted (dedupe runs among survivors only).
+        path = self._csv(
+            tmp_path,
+            ",".join(STYLE_A_HEADERS) + "\n",
+            [
+                "UTR_DUP,1,SBIN0000001,2,SBIN0000002,-5.00,2024-06-01 10:30:00,UPI,,",
+                "UTR_DUP,1,SBIN0000001,2,SBIN0000002,10.00,2024-06-01 10:31:00,UPI,,",
+            ],
+            "dup.csv",
+        )
+        df, report = DatasetIngester().ingest(str(path))
+        assert report.rows_accepted == 1 and df.height == 1
+        assert df["txn_id"].item() == "UTR_DUP"
+        assert report.rows_rejected == 1
+        assert report.failure_counts == {"negative_amount": 1}
+
+    def test_report_counts_partition_the_source(self, tmp_path) -> None:
+        path = self._csv(
+            tmp_path,
+            ",".join(STYLE_A_HEADERS) + "\n",
+            [
+                "UTR_P1,1,SBIN0000001,2,SBIN0000002,10,2024-06-01 10:30:00,UPI,,",
+                "UTR_P1,1,SBIN0000001,2,SBIN0000002,10,2024-06-01 10:31:00,UPI,,",
+                "UTR_P2,1,SBIN0000001,2,SBIN0000002,-1,2024-06-01 10:32:00,UPI,,",
+                "UTR_P3,1,SBIN0000001,2,SBIN0000002,10,NOPE,UPI,,",
+            ],
+            "partition.csv",
+        )
+        df, report = DatasetIngester().ingest(str(path))
+        assert report.rows_total == 4
+        assert report.rows_total == report.rows_accepted + report.rows_rejected
+        assert report.rows_accepted == df.height == 1
+        assert report.failure_counts == {
+            "duplicate_utr": 1, "negative_amount": 1, "unparseable_timestamp": 1,
+        }

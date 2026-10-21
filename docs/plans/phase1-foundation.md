@@ -2896,6 +2896,42 @@ Expected: both `... ok` lines; no network calls; completes in a few seconds (5,0
 
 ---
 
+## Post-review amendments (applied after the Phase-1 final review)
+
+The final whole-branch review found input-handling defects the Task 3-5 plans
+did not pin. They are fixed and pinned by `TestHostileInputs`
+(`tests/test_phase1.py`):
+
+1. **Epoch units are bounded.** Only seconds (`10^9..10^12`) and milliseconds
+   (`10^12..10^13`) are recognised. 15/16-digit (microsecond) values are
+   rejected as `unparseable_timestamp` instead of materialising as year
+   7411/56385 — polars' `from_epoch` panics for unrepresentable years, and
+   that panic derives from `BaseException`, so it escapes `except Exception`.
+2. **Parsed timestamps are range-checked** to 1900-01-01 .. 2100-01-01;
+   outside it, a transaction/complaint timestamp is `unparseable_timestamp` and
+   an account opening date is `invalid_account_opening_date`.
+3. **Amounts must be finite.** `NaN` / `inf` / `1e400` are
+   `unparseable_amount` (a NaN silently poisons every downstream sum).
+4. **Empty sources never raise.** A 0-byte CSV, a header-only XLSX and a
+   completely empty XLSX return a conforming empty frame and a zeroed report;
+   the XLSX path recovers the header row via openpyxl.
+5. **The audit preserves source fidelity.** `rejected_rows` is built from the
+   pristine source frame, so a source whose headers *are* the canonical names
+   still shows the original text rather than the normalized value. A source
+   column literally named `rejection_reason` is renamed to
+   `rejection_reason_source` (the reason column keeps the documented name).
+6. **The rejection vocabulary is explicit**: `REJECTION_REASONS`
+   (`ingestion.mapper`) lists every reason per table, including the new
+   `invalid_account_opening_date`.
+
+**Simulator note for Phase 2:** scheme transaction legs keep the constant
+`_SCHEME_IFSC` on both sides (plan Decision), while the scheme account master
+rows carry per-block IFSCs (`_SCHEME_IFSC_BY_BLOCK`). Phase-2 graph joins must
+therefore key on `account_no`, never on IFSC — joining on IFSC would silently
+drop all 249 labeled fraud edges.
+
+---
+
 ## Self-Review (author-checked before submission, incl. post-review amendments)
 
 - **Spec coverage:** deliverable 1 → Task 2; deliverable 2 → Tasks 3–5 (now covering transactions, NCRP complaints and account metadata); deliverable 3 → Tasks 6–7; spec bullet groups as labeled test classes (`TestHeaderMapping` covers 3 transaction styles + the complaint/account styles + cross-table silo checks; `TestIngestRejections` covers negative/corrupt-date/duplicate-UTR; `TestSimulatorBackground` + `TestSchemes`/`TestComplaints` cover reproducibility and ground truth). `mypy src` cleanliness → Task 1 config + per-task verification. "Polars and DuckDB idioms, no iterrows" → Global Constraints; DuckDB deferred. "Pure offline" → Global Constraints + generator determinism choices.
