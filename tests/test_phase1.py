@@ -570,13 +570,13 @@ class TestIngestRejections:
         assert df.height == 0
 
     def test_unsupported_payment_mode_rejected(self, tmp_path) -> None:
-        df, report = self._ingest_rows(tmp_path, [
+        _df, report = self._ingest_rows(tmp_path, [
             "UTR_R6,1,SBIN0000001,2,SBIN0000002,10,2024-06-01 10:30:00,CHEQUE,,",
         ])
         assert report.failure_counts == {"unsupported_payment_mode": 1}
 
     def test_priority_missing_beats_all(self, tmp_path) -> None:
-        df, report = self._ingest_rows(tmp_path, [
+        _df, report = self._ingest_rows(tmp_path, [
             "UTR_R7,,SBIN0000001,2,SBIN0000002,-10,NOT-A-DATE,ZZZ,,",
         ])
         assert report.failure_counts == {"missing:sender_account": 1}
