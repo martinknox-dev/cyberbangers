@@ -1,0 +1,38 @@
+[project]
+name = "prahar-graph"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Martin Knox", email = "kailashnarmatha@gmail.com" }
+]
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "duckdb>=1.5.6",
+    "jinja2>=3.1.6",
+    "networkx>=3.7",
+    "openpyxl>=3.1.5",
+    "plotly>=7.1.0",
+    "polars>=2.0.0",
+    "pydantic>=2.14.1",
+    "rapidfuzz>=3.14.6",
+    "scikit-learn>=1.9.1",
+    "shap>=0.54.0",
+    "st-link-analysis>=0.4.0",
+    "streamlit>=1.66.0",
+]
+
+[project.scripts]
+prahar-graph = "prahar_graph:main"
+
+[build-system]
+requires = ["uv_build>=0.13.4,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.0",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.1",
+]
