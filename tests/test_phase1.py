@@ -157,3 +157,151 @@ class TestContracts:
         assert m.confidence == 1.0
         with pytest.raises(ValidationError):
             ColumnMapping(raw_name="x", canonical_name=None, confidence=1.5)
+
+
+from ingestion.mapper import map_headers, normalize_header
+
+STYLE_A_HEADERS: list[str] = [   # core-banking CSV export (bank style, underscored codes)
+    "UTR", "Debit_Acc", "Fr_IFSC", "PAYEE", "To_IFSC", "Amount_INR",
+    "Txn_Time", "Mode", "Device", "IP",
+]
+STYLE_B_HEADERS: list[str] = [   # branch XLSX sheet (spaced title-case)
+    "Transaction Ref", "Originator Acct", "Remitter IFSC", "To Account",
+    "Beneficiary Branch IFSC", "Txn Amount", "Txn DateTime", "Pay Method",
+    "Device No", "Customer IP",
+]
+STYLE_C_HEADERS: list[str] = [   # complaint-portal dump (mixed snake + CamelCase)
+    "txn ref id", "sender account", "Sender IFSC Code", "beneficiary_account",
+    "Receiver IFSC Code", "amount", "datetime_of_txn", "channel",
+    "imei_device", "IP",
+]
+
+STYLE_A_EXPECTED: dict[str, str] = {
+    "UTR": "txn_id", "Debit_Acc": "sender_account", "Fr_IFSC": "sender_ifsc",
+    "PAYEE": "receiver_account", "To_IFSC": "receiver_ifsc",
+    "Amount_INR": "amount", "Txn_Time": "timestamp", "Mode": "payment_mode",
+    "Device": "device_id", "IP": "ip_address",
+}
+STYLE_B_EXPECTED: dict[str, str] = {
+    "Transaction Ref": "txn_id", "Originator Acct": "sender_account",
+    "Remitter IFSC": "sender_ifsc", "To Account": "receiver_account",
+    "Beneficiary Branch IFSC": "receiver_ifsc", "Txn Amount": "amount",
+    "Txn DateTime": "timestamp", "Pay Method": "payment_mode",
+    "Device No": "device_id", "Customer IP": "ip_address",
+}
+STYLE_C_EXPECTED: dict[str, str] = {
+    "txn ref id": "txn_id", "sender account": "sender_account",
+    "Sender IFSC Code": "sender_ifsc", "beneficiary_account": "receiver_account",
+    "Receiver IFSC Code": "receiver_ifsc", "amount": "amount",
+    "datetime_of_txn": "timestamp", "channel": "payment_mode",
+    "imei_device": "device_id", "IP": "ip_address",
+}
+
+COMPLAINT_HEADERS: list[str] = [   # NCRP-portal style dump (report-officer wording)
+    "Complaint Ack No", "Victim Acc No", "Suspect Acc No", "Fraud Category",
+    "Reported On", "Cheated Amount", "Disputed UTR Ref", "State",
+]
+ACCOUNT_HEADERS: list[str] = [    # core-banking customer master sheet
+    "Account Number", "IFSC Code", "Date of Opening", "Home Branch Code",
+    "Mobile Number", "Device IMEI", "KYC Pincode", "Acct Type",
+]
+COMPLAINT_EXPECTED: dict[str, str] = {
+    "Complaint Ack No": "ack_no", "Victim Acc No": "victim_account",
+    "Suspect Acc No": "suspect_account", "Fraud Category": "fraud_category",
+    "Reported On": "reported_timestamp", "Cheated Amount": "disputed_amount",
+    "Disputed UTR Ref": "disputed_utr", "State": "state",
+}
+ACCOUNT_EXPECTED: dict[str, str] = {
+    "Account Number": "account_no", "IFSC Code": "ifsc",
+    "Date of Opening": "account_opening_date", "Home Branch Code": "branch_code",
+    "Mobile Number": "mobile_no", "Device IMEI": "imei",
+    "KYC Pincode": "kyc_pincode", "Acct Type": "account_type",
+}
+MULTI_TABLE_EXACT_CONFS: dict[tuple[str, str], float] = {
+    # (table, raw header): probe-computed confidence
+    ("complaints", "Complaint Ack No"): 0.8966,
+    ("complaints", "Disputed UTR Ref"): 0.8571,
+    ("accounts", "Date of Opening"): 0.8889,
+    ("accounts", "Home Branch Code"): 0.8148,
+}
+
+
+class TestHeaderMapping:
+    def test_normalize_header(self) -> None:
+        assert normalize_header("Beneficiary-Acc  No#2") == "beneficiary acc no 2"
+        assert normalize_header("  UTR ") == "utr"
+
+    def test_style_a_full_coverage(self) -> None:
+        mapping = map_headers(STYLE_A_HEADERS)
+        for raw, canonical in STYLE_A_EXPECTED.items():
+            assert mapping[raw].canonical_name == canonical, raw
+            assert mapping[raw].confidence >= 0.80, (raw, mapping[raw].confidence)
+
+    def test_style_b_full_coverage(self) -> None:
+        mapping = map_headers(STYLE_B_HEADERS)
+        for raw, canonical in STYLE_B_EXPECTED.items():
+            assert mapping[raw].canonical_name == canonical, raw
+            assert mapping[raw].confidence >= 0.80, raw
+
+    def test_style_c_full_coverage_with_exact_confidences(self) -> None:
+        mapping = map_headers(STYLE_C_HEADERS)
+        exact_confs: dict[str, float] = {
+            "txn ref id": 0.824, "sender account": 1.0, "Sender IFSC Code": 0.815,
+            "beneficiary_account": 1.0, "Receiver IFSC Code": 0.839,
+            "amount": 1.0, "datetime_of_txn": 0.889, "channel": 1.0,
+            "imei_device": 0.80, "IP": 1.0,
+        }
+        for raw, canonical in STYLE_C_EXPECTED.items():
+            assert mapping[raw].canonical_name == canonical, raw
+            assert abs(mapping[raw].confidence - exact_confs[raw]) <= 1e-3, raw
+
+    def test_complaint_and_account_style_coverage_with_exact_confs(self) -> None:
+        m_c = map_headers(COMPLAINT_HEADERS, table="complaints")
+        for raw, canonical in COMPLAINT_EXPECTED.items():
+            assert m_c[raw].canonical_name == canonical, raw
+            assert m_c[raw].confidence >= 0.80, raw
+        m_a = map_headers(ACCOUNT_HEADERS, table="accounts")
+        for raw, canonical in ACCOUNT_EXPECTED.items():
+            assert m_a[raw].canonical_name == canonical, raw
+            assert m_a[raw].confidence >= 0.80, raw
+        # exact-confidence checks (the marginal headers per table):
+        for raw in ("Complaint Ack No", "Disputed UTR Ref"):
+            assert abs(m_c[raw].confidence - MULTI_TABLE_EXACT_CONFS[("complaints", raw)]) <= 1e-3, raw
+        for raw in ("Date of Opening", "Home Branch Code"):
+            assert abs(m_a[raw].confidence - MULTI_TABLE_EXACT_CONFS[("accounts", raw)]) <= 1e-3, raw
+
+    def test_default_call_maps_transactions_only(self) -> None:
+        # Without `table=`, complaint/account-specific headers must NOT claim
+        # transaction canonicals, and transaction headers must not claim
+        # complaint canonicals (tables are siloed by the synonym registry).
+        tx_style = map_headers(["Cheated Amount", "Victim Acc No"])
+        assert tx_style["Cheated Amount"].canonical_name is None
+        assert tx_style["Victim Acc No"].canonical_name is None
+        cx_style = map_headers(["Amount_INR", "Txn_Time"], table="complaints")
+        assert cx_style["Amount_INR"].canonical_name is None
+        assert cx_style["Txn_Time"].canonical_name is None
+
+    def test_noise_headers_unmapped(self) -> None:
+        mapping = map_headers(
+            ["Narration", "Remarks", "Sl No", "Balance", "SenderIFSC", "ReceiverBranchIFSC"]
+        )
+        for raw, entry in mapping.items():
+            assert entry.canonical_name is None, raw
+            assert entry.confidence < 0.80, raw
+
+    def test_below_threshold_is_dropped(self) -> None:
+        mapping = map_headers(["Narration"], confidence_threshold=0.55)
+        assert mapping["Narration"].canonical_name is None  # best score 52.2 < 55
+
+    def test_canonical_collision_exact_tie_keeps_first(self) -> None:
+        mapping = map_headers(["To Account", "PAYEE"])  # both hit receiver_account @ 100
+        assert mapping["To Account"].canonical_name == "receiver_account"
+        assert mapping["PAYEE"].canonical_name is None     # tie -> first-seen wins
+        assert mapping["PAYEE"].confidence == 1.0          # loser keeps its own score
+
+    def test_canonical_collision_higher_confidence_wins(self) -> None:
+        # "Credit_Acc_No" scores ~0.741 against credit_account; "To Account" 1.0.
+        mapping = map_headers(["Credit_Acc_No", "To Account"])
+        assert mapping["To Account"].canonical_name == "receiver_account"
+        assert mapping["Credit_Acc_No"].canonical_name is None
+        assert mapping["Credit_Acc_No"].confidence < 0.80
