@@ -545,7 +545,7 @@ git commit -m "phase1(2): pydantic contracts and canonical polars schemas"
 ### Task 3: `ingestion/mapper.py` — synonym table + fuzzy header mapping
 
 **Files:**
-- Create: `src/ingestion/mapper.py` (mapping half; readers/normalization stubs come in Task 4 — but `DatasetIngester` class shell is created here so the module is import-clean)
+- Create: `src/ingestion/mapper.py` (mapping half only; readers, normalization and `DatasetIngester` arrive in Task 4)
 - Test: `tests/test_phase1.py` (add `TestHeaderMapping`)
 
 **Interfaces:**
@@ -1052,7 +1052,7 @@ class TestIngestHappyPath:
         assert as_csv.height == 1 and report.rows_accepted == 1
         import zipfile
 
-        with pytest.raises(zipfile.BadZipFile):
+        with pytest.raises(openpyxl.utils.exceptions.InvalidFileException):
             DatasetIngester().ingest_xlsx(str(path))
 
     def test_mapping_report_records_confidence(self, tmp_path) -> None:
@@ -1066,65 +1066,8 @@ class TestIngestHappyPath:
         assert m.matched_synonym == "debit_account"
         assert m.confidence >= 0.80
         assert report.column_mapping["UTR"].canonical_name == "txn_id"
-```
 
-Pinned behavior note for `test_explicit_reader_override_on_suffixless_path`: an explicit reader choice means caller intent, and a non-XLSX payload through `ingest_xlsx` raises the underlying zip error (openpyxl calls `zipfile.load` ⇒ `zipfile.BadZipFile`) rather than being silently misread. If, during execution, polars/openpyxl surfaces a different concrete exception for the same payload, pin that exact type instead — the *behavior* (no silent misread) is the invariant, not the error taxonomy. Importing `zipfile` at function scope keeps the module import list clean.
 
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `uv run pytest tests/test_phase1.py::TestIngestHappyPath -q`
-Expected: FAIL — `AttributeError: 'DatasetIngester' object has no attribute 'ingest'` (class shell exists from Task 3 but without methods) plus missing module attrs.
-
-- [ ] **Step 3: Implement readers + normalization + ingester methods (mapper.py continue)**
-
-Place after the Task-3 code. Import list becomes:
-
-```python
-import io
-import re
-from collections.abc import Sequence
-from pathlib import Path
-from typing import Final
-
-import polars as pl
-from rapidfuzz import fuzz
-
-from core.contracts import (
-    ACCOUNT_COLUMNS,
-    ACCOUNT_METADATA_SCHEMA,
-    COMPLAINT_COLUMNS,
-    COMPLAINT_SCHEMA,
-    IFSC_PATTERN,
-    TRANSACTION_COLUMNS,
-    TRANSACTION_SCHEMA,
-    ColumnMapping,
-    IngestionReport,
-    TableKind,
-)
-```
-(`MANDATORY_COLUMNS` and nothing else lands in Task 5's validation step; `IFSC_PATTERN` is needed here by `_ifsc_expr`; `TableKind` keys the per-table registries.)
-
-```python
-# --- canonical value expressions -------------------------------------------
-
-TS_FORMATS: Final[tuple[str, ...]] = (
-    "%Y-%m-%dT%H:%M:%S%.f",
-    "%Y-%m-%d %H:%M:%S%.f",
-    "%Y-%m-%dT%H:%M:%S",
-    "%Y-%m-%d %H:%M:%S",
-    "%d/%m/%Y %I:%M:%S %p",
-    "%d/%m/%Y %H:%M:%S",
-    "%d/%m/%Y",
-    "%m/%d/%Y %H:%M:%S",
-    "%m/%d/%Y",
-    "%d-%m-%Y %H:%M:%S",
-    "%d-%m-%Y",
-    "%Y-%m-%d",
-)
-
-Pinned behavior note for `test_explicit_reader_override_on_suffixless_path`: an explicit reader choice means caller intent, and a non-XLSX payload through `ingest_xlsx` raises the underlying zip error (openpyxl calls `zipfile.load` ⇒ `zipfile.BadZipFile`) rather than being silently misread. If, during execution, polars/openpyxl surfaces a different concrete exception for the same payload, pin that exact type instead — the *behavior* (no silent misread) is the invariant, not the error taxonomy. Importing `zipfile` at function scope keeps the module import list clean.
-
-```python
 def complaint_csv_bytes(rows: list[str]) -> bytes:
     header = ",".join(COMPLAINT_HEADERS) + "\n"
     return (header + "\n".join(rows) + "\n").encode("utf-8")
@@ -1188,7 +1131,63 @@ class TestIngestMultiTableHappy:
         df, report = DatasetIngester().ingest(str(path))
         assert report.rows_rejected == 0
         assert df["payment_mode"].to_list() == ["RTGS", "ATM", "AEPS", "UPI", "UPI"]
-```</think>**Edit 14 — Task 4 normalization code: alias-extended `MODE_CANONICAL` + account/date/pattern/type expressions:**<tool_call>edit<arg_key>newString</arg_key><arg_value>MODE_CANONICAL: Final[dict[str, str]] = {
+```
+
+Pinned behavior note for `test_explicit_reader_override_on_suffixless_path`: an explicit reader choice means caller intent, and a non-XLSX payload through `ingest_xlsx` raises openpyxl's `InvalidFileException` (polars/openpyxl refuses the non-spreadsheet payload) rather than silently misreading it. The *behavior* (no silent misread) is the invariant, not the error taxonomy; the exact type was pinned during execution (Task 4 Step 4).
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `uv run pytest tests/test_phase1.py::TestIngestHappyPath -q`
+Expected: FAIL — `ImportError: cannot import name 'DatasetIngester' from 'ingestion.mapper'` (Task 3 has no class shell).
+
+- [ ] **Step 3: Implement readers + normalization + ingester methods (mapper.py continue)**
+
+Place after the Task-3 code. Import list becomes:
+
+```python
+import io
+import re
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Final
+
+import polars as pl
+from rapidfuzz import fuzz
+
+from core.contracts import (
+    ACCOUNT_COLUMNS,
+    ACCOUNT_METADATA_SCHEMA,
+    COMPLAINT_COLUMNS,
+    COMPLAINT_SCHEMA,
+    IFSC_PATTERN,
+    TRANSACTION_COLUMNS,
+    TRANSACTION_SCHEMA,
+    ColumnMapping,
+    IngestionReport,
+    TableKind,
+)
+```
+(`MANDATORY_COLUMNS` and nothing else lands in Task 5's validation step; `IFSC_PATTERN` is needed here by `_ifsc_expr`; `TableKind` keys the per-table registries.)
+
+```python
+# --- canonical value expressions -------------------------------------------
+
+TS_FORMATS: Final[tuple[str, ...]] = (
+    "%Y-%m-%dT%H:%M:%S%.f",
+    "%Y-%m-%d %H:%M:%S%.f",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%d/%m/%Y %I:%M:%S %p",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y",
+    "%d-%m-%Y %H:%M:%S",
+    "%d-%m-%Y",
+    "%Y-%m-%d",
+)
+
+MODE_CANONICAL: Final[dict[str, str]] = {
     "UPI": "UPI",
     "BHIM UPI": "UPI",
     "UPI P2P": "UPI",

@@ -1,7 +1,9 @@
 """Phase 1 acceptance tests: contracts, fuzzy ingestion, deterministic simulator."""
+import io
 import json
 from datetime import date, datetime
 
+import openpyxl
 import polars as pl
 import pytest
 from pydantic import ValidationError
@@ -159,7 +161,7 @@ class TestContracts:
             ColumnMapping(raw_name="x", canonical_name=None, confidence=1.5)
 
 
-from ingestion.mapper import map_headers, normalize_header
+from ingestion.mapper import DatasetIngester, map_headers, normalize_header
 
 STYLE_A_HEADERS: list[str] = [   # core-banking CSV export (bank style, underscored codes)
     "UTR", "Debit_Acc", "Fr_IFSC", "PAYEE", "To_IFSC", "Amount_INR",
@@ -305,3 +307,191 @@ class TestHeaderMapping:
         assert mapping["To Account"].canonical_name == "receiver_account"
         assert mapping["Credit_Acc_No"].canonical_name is None
         assert mapping["Credit_Acc_No"].confidence < 0.80
+
+
+def csv_bytes(rows: list[str]) -> bytes:
+    header = ",".join(STYLE_A_HEADERS) + "\n"
+    return (header + "\n".join(rows) + "\n").encode("utf-8")
+
+
+def style_a_xlsx(header: list[str], rows: list[list[object]]) -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    assert ws is not None
+    for c, name in enumerate(header, start=1):
+        ws.cell(column=c, row=1, value=name)
+    for r, row in enumerate(rows, start=2):
+        for c, value in enumerate(row, start=1):
+            ws.cell(column=c, row=r, value=value)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+class TestIngestHappyPath:
+    def test_csv_path_all_three_header_styles_accepted(self, tmp_path) -> None:
+        style_rows: dict[str, list[str]] = {
+            "a": [
+                "UTR_A1,2900000001,SBIN0001234,2900000002,SBIN0009876,15000.50,2024-06-01 10:30:00,UPI,D000123,10.20.30.40",
+            ],
+            "b": [
+                "UTR_B1,2900000001,SBIN0001234,2900000002,SBIN0009876,2499.00,01/06/2024 11:45:30,IMPS,D000124,10.20.30.41",
+            ],
+            "c": [
+                "UTR_C1,2900000001,SBIN0001234,2900000002,SBIN0009876,777.75,2024-06-01T12:00:00,NEFT,D000125,10.20.30.42",
+            ],
+        }
+        headers_by: dict[str, list[str]] = {
+            "a": STYLE_A_HEADERS, "b": STYLE_B_HEADERS, "c": STYLE_C_HEADERS,
+        }
+        for key, rows in style_rows.items():
+            path = tmp_path / f"style_{key}.csv"
+            path.write_bytes(
+                (",".join(headers_by[key]) + "\n" + rows[0] + "\n").encode("utf-8")
+            )
+            df, report = DatasetIngester().ingest(str(path))
+            assert df.height == 1
+            assert report.rows_total == 1
+            assert report.rows_accepted == 1 and report.rows_rejected == 0
+            assert list(df.columns) == list(TRANSACTION_COLUMNS)
+            assert df.dtypes == [TRANSACTION_SCHEMA[c] for c in TRANSACTION_COLUMNS]
+            assert df["txn_id"].item() == f"UTR_{key.upper()}1"
+
+    def test_dd_mm_precedes_mm_dd(self, tmp_path) -> None:
+        rows = [
+            "UTR_D1,2900000001,SBIN0001234,2900000002,SBIN0009876,500.00,05/06/2024 09:15:00,UPI,,",
+            "UTR_D2,2900000001,SBIN0001234,2900000002,SBIN0009876,500.00,12/31/2024 09:15:00,UPI,,",
+            "UTR_D3,2900000001,SBIN0001234,2900000002,SBIN0009876,500.00,05/06/2024 09:15:52 PM,UPI,,",
+        ]
+        path = tmp_path / "dd_mm.csv"
+        path.write_bytes((",".join(STYLE_A_HEADERS) + "\n" + "\n".join(rows) + "\n").encode())
+        df, report = DatasetIngester().ingest(str(path))
+        assert report.rows_rejected == 0
+        stamps = {r["txn_id"]: r["timestamp"] for r in df.to_dicts()}
+        assert stamps["UTR_D1"] == datetime(2024, 6, 5, 9, 15, 0)
+        assert stamps["UTR_D2"] == datetime(2024, 12, 31, 9, 15, 0)
+        assert stamps["UTR_D3"] == datetime(2024, 6, 5, 21, 15, 52)
+
+    def test_unix_timestamp_seconds_and_ms(self, tmp_path) -> None:
+        rows = [
+            "UTR_E1,1,SBIN0000001,2,SBIN0000002,10,1717200000,UPI,,",
+            "UTR_E2,1,SBIN0000001,2,SBIN0000002,10,1717200002000,IMPS,,",
+        ]
+        path = tmp_path / "epoch.csv"
+        path.write_bytes((",".join(STYLE_A_HEADERS) + "\n" + "\n".join(rows) + "\n").encode())
+        df, report = DatasetIngester().ingest(str(path))
+        assert report.rows_rejected == 0
+        assert sorted(df["timestamp"].to_list()) == [
+            datetime(2024, 6, 1, 0, 0, 0), datetime(2024, 6, 1, 0, 0, 2),
+        ]
+
+    def test_xlsx_bytes_with_native_cells(self) -> None:
+        payload = style_a_xlsx(
+            STYLE_A_HEADERS,
+            [[
+                "UTR_X1", "2900000001", "sbin0001234", "2900000002",
+                "SBIN0009876", 100.5, datetime(2024, 6, 1, 3, 4, 5), "BHIM UPI",
+                "D000001", "10.0.0.1",
+            ]],
+        )
+        df, report = DatasetIngester().ingest(payload)   # bytes -> xlsx via PK magic sniff
+        assert report.rows_accepted == 1
+        assert df["amount"].item() == pytest.approx(100.5)
+        assert df["timestamp"].item() == datetime(2024, 6, 1, 3, 4, 5)
+        assert df["payment_mode"].item() == "UPI"
+        assert df["sender_ifsc"].item() == "SBIN0001234"   # lowercased input upcased + validated
+
+    def test_bytes_csv_via_sniff(self) -> None:
+        payload = csv_bytes([
+            "UTR_F1,1,SBIN0000001,2,SBIN0000002,25.00,2024-06-01 10:00:00,CASH,dev1,1.2.3.4",
+        ])
+        df, report = DatasetIngester().ingest(payload)
+        assert report.rows_accepted == 1
+        assert df["payment_mode"].item() == "CASH"
+
+    def test_explicit_reader_override_on_suffixless_path(self, tmp_path) -> None:
+        path = tmp_path / "only"
+        path.write_bytes(csv_bytes([
+            "UTR_G1,1,SBIN0000001,2,SBIN0000002,25.00,2024-06-01 10:00:00,CASH,dev2,1.2.3.5",
+        ]))
+        as_csv, report = DatasetIngester().ingest_csv(str(path))
+        assert as_csv.height == 1 and report.rows_accepted == 1
+        with pytest.raises(openpyxl.utils.exceptions.InvalidFileException):
+            DatasetIngester().ingest_xlsx(str(path))
+
+    def test_mapping_report_records_confidence(self, tmp_path) -> None:
+        path = tmp_path / "m.csv"
+        path.write_bytes(csv_bytes([
+            "UTR_H1,1,SBIN0000001,2,SBIN0000002,25.00,2024-06-01 10:00:00,CASH,dev3,1.2.3.6",
+        ]))
+        _df, report = DatasetIngester().ingest(str(path))
+        m = report.column_mapping["Debit_Acc"]
+        assert m.canonical_name == "sender_account"
+        assert m.matched_synonym == "debit_account"
+        assert m.confidence >= 0.80
+        assert report.column_mapping["UTR"].canonical_name == "txn_id"
+
+
+def complaint_csv_bytes(rows: list[str]) -> bytes:
+    header = ",".join(COMPLAINT_HEADERS) + "\n"
+    return (header + "\n".join(rows) + "\n").encode("utf-8")
+
+
+def account_xlsx_bytes(rows: list[list[object]]) -> bytes:
+    return style_a_xlsx(ACCOUNT_HEADERS, rows)
+
+
+class TestIngestMultiTableHappy:
+    def test_complaints_csv_happy_path(self, tmp_path) -> None:
+        path = tmp_path / "ncrp.csv"
+        path.write_bytes(complaint_csv_bytes([
+            'ACK20240001,2900000007,2990100000,AEPS_CASHOUT,02/06/2024 09:15:00,"32,000.50",UTR2024060100001,Bihar',
+        ]))
+        df, report = DatasetIngester().ingest_complaints(str(path))
+        assert df.height == 1
+        assert list(df.columns) == list(COMPLAINT_COLUMNS)
+        assert df["ack_no"].item() == "ACK20240001"
+        assert df["disputed_utr"].item() == "UTR2024060100001"
+        # DD/MM precedence + comma-junk amount survive the shared pipeline:
+        assert df["reported_timestamp"].item() == datetime(2024, 6, 2, 9, 15, 0)
+        assert df["disputed_amount"].item() == pytest.approx(32000.5)
+        assert df["suspect_account"].item() == "2990100000"
+        assert report.rows_accepted == 1 and report.rows_rejected == 0
+
+    def test_complaints_headers_do_not_claim_transaction_columns(self, tmp_path) -> None:
+        path = tmp_path / "ncrp.csv"
+        path.write_bytes(complaint_csv_bytes([
+            "ACK20240002,2900000007,2990100001,UPI_FRAUD,02/06/2024 09:15:00,1500,UTR2024060100002,Delhi",
+        ]))
+        df, report = DatasetIngester().ingest_complaints(str(path))
+        assert df.height == 1 and report.rows_accepted == 1
+
+    def test_accounts_xlsx_native_date_cell(self) -> None:
+        payload = account_xlsx_bytes([[
+            "2900000007", "sbin0001234", date(2023, 1, 15), "BR001",
+            9178451234, "351104510123456", "800013", "savings",
+        ]])
+        df, report = DatasetIngester().ingest_accounts(payload)   # PK magic sniff
+        assert df.height == 1
+        assert list(df.columns) == list(ACCOUNT_COLUMNS)
+        # openpyxl-native datetime cell -> String "2023-01-15 00:00:00.000000" -> Date:
+        assert df["account_opening_date"].item() == date(2023, 1, 15)
+        assert df["account_type"].item() == "SAVINGS"     # lowercase alias upcased
+        assert df["ifsc"].item() == "SBIN0001234"         # lowercase input upcased
+        assert df["mobile_no"].item() == "9178451234"     # numeric cell cast to String
+        assert df["imei"].item() == "351104510123456"
+        assert report.rows_accepted == 1
+
+    def test_payment_mode_alias_expansion(self, tmp_path) -> None:
+        rows = [
+            "UTR_N1,1,SBIN0000001,2,SBIN0000002,10,2024-06-01 10:00:00,RTGS,,",
+            "UTR_N2,1,SBIN0000001,2,SBIN0000002,10,2024-06-01 10:05:00,ATM WITHDRAWAL,,",
+            "UTR_N3,1,SBIN0000001,2,SBIN0000002,10,2024-06-01 10:10:00,MICRO ATM,,",
+            "UTR_N4,1,SBIN0000001,2,SBIN0000002,10,2024-06-01 10:15:00,UPI/P2M,,",
+            "UTR_N5,1,SBIN0000001,2,SBIN0000002,10,2024-06-01 10:20:00,UPI/P2P,,",
+        ]
+        path = tmp_path / "modes.csv"
+        path.write_bytes((",".join(STYLE_A_HEADERS) + "\n" + "\n".join(rows) + "\n").encode())
+        df, report = DatasetIngester().ingest(str(path))
+        assert report.rows_rejected == 0
+        assert df["payment_mode"].to_list() == ["RTGS", "ATM", "AEPS", "UPI", "UPI"]
