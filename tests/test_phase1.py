@@ -685,3 +685,65 @@ class TestIngestMultiTableRejections:
         df, report = DatasetIngester().ingest_accounts(str(path))
         assert report.failure_counts == {"missing:branch_code": 1}
         assert df.height == 0
+
+
+from simulator.generator import LABELED_TRANSACTION_SCHEMA, SyndicateDataSimulator
+
+
+class TestSimulatorBackground:
+    def test_default_shape_and_validation(self) -> None:
+        result = SyndicateDataSimulator(seed=42).generate(background_transactions=5_000)
+        t = result.transactions
+        # height = background count + emitted labeled rows (0 in Task 6; 249 after Task 7)
+        assert t.height == 5_000 + int(t["is_fraud"].sum())
+        with pytest.raises(ValueError):
+            SyndicateDataSimulator().generate(background_transactions=4_999)
+        with pytest.raises(ValueError):
+            SyndicateDataSimulator().generate(background_transactions=20_001)
+
+    def test_schema_conformance_and_defaults(self) -> None:
+        result = SyndicateDataSimulator(seed=42).generate()
+        assert result.transactions.columns == list(LABELED_TRANSACTION_SCHEMA)
+        assert result.accounts.columns == list(ACCOUNT_METADATA_SCHEMA)
+        assert result.accounts.height == 1000
+        assert result.transactions.dtypes == [
+            LABELED_TRANSACTION_SCHEMA[c] for c in result.transactions.columns
+        ]
+
+    def test_background_all_unlabeled(self) -> None:
+        result = SyndicateDataSimulator().generate(background_transactions=6_000)
+        bg = result.transactions.filter(~pl.col("is_fraud"))
+        assert bg.height == 6_000
+        assert bg["fraud_scheme"].null_count() == bg.height
+
+    def test_txn_ids_unique_and_background_prefixed(self) -> None:
+        result = SyndicateDataSimulator().generate()
+        ids = result.transactions["txn_id"]
+        assert ids.n_unique() == ids.len()
+        bg_ids = result.transactions.filter(~pl.col("is_fraud"))["txn_id"]
+        assert bg_ids.str.starts_with("BG").all()
+
+    def test_all_accounts_referenceable(self) -> None:
+        result = SyndicateDataSimulator().generate()
+        accounts = set(result.accounts["account_no"].to_list())
+        used = (
+            set(result.transactions["sender_account"].to_list())
+            | set(result.transactions["receiver_account"].to_list())
+        )
+        assert used <= accounts
+
+    def test_transactions_sorted(self) -> None:
+        result = SyndicateDataSimulator().generate()
+        expected = result.transactions.sort(["timestamp", "txn_id"])
+        assert result.transactions.equals(expected)
+
+    def test_deterministic_same_seed(self) -> None:
+        a = SyndicateDataSimulator(seed=42).generate()
+        b = SyndicateDataSimulator(seed=42).generate()
+        assert a.transactions.equals(b.transactions)
+        assert a.accounts.equals(b.accounts)
+
+    def test_different_seed_changes_stream(self) -> None:
+        a = SyndicateDataSimulator(seed=42).generate(background_transactions=5_000)
+        b = SyndicateDataSimulator(seed=7).generate(background_transactions=5_000)
+        assert not a.transactions.equals(b.transactions)
