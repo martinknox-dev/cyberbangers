@@ -49,3 +49,15 @@ mypy_path = "src"
 [[tool.mypy.overrides]]
 module = "openpyxl.*"
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "networkx.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "sklearn.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "shap.*"
+ignore_missing_imports = true

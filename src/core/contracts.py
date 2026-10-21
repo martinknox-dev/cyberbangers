@@ -13,7 +13,7 @@ from datetime import date, datetime
 from typing import Literal
 
 import polars as pl
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PaymentMode = Literal["UPI", "IMPS", "NEFT", "RTGS", "AEPS", "ATM", "CASH"]
 AccountType = Literal["SAVINGS", "PMJDY", "CURRENT"]
@@ -146,3 +146,267 @@ class IngestionReport(BaseModel):
     failure_counts: dict[str, int] = Field(default_factory=dict)
     column_mapping: dict[str, ColumnMapping] = Field(default_factory=dict)
     rejected_rows: pl.DataFrame = pl.DataFrame()
+
+
+# --- Phase 2: behavioural features, graph indicators, risk report ------------
+
+ACCOUNT_FEATURE_SCHEMA: dict[str, pl.DataType] = {
+    "account_no": pl.String(),
+    "txn_count": pl.Int64(),
+    "inflow_count": pl.Int64(),
+    "outflow_count": pl.Int64(),
+    "inflow_total": pl.Float64(),
+    "outflow_total": pl.Float64(),
+    "net_flow": pl.Float64(),
+    "unique_senders": pl.Int64(),
+    "unique_receivers": pl.Int64(),
+    "fan_in_fan_out_asymmetry": pl.Float64(),
+    "pass_through_ratio_15m": pl.Float64(),
+    "median_retention_minutes": pl.Float64(),
+    "smurf_bulk_inflow_count": pl.Int64(),
+    "smurf_split_count": pl.Int64(),
+    "large_payout_count": pl.Int64(),
+    "burst_24h_max_total": pl.Float64(),
+    "dormancy_days_before_burst": pl.Float64(),
+    "dormancy_burst_score": pl.Float64(),
+    "shared_device_account_count": pl.Int64(),
+    "branch_cohort_48h_count": pl.Int64(),
+    "aeps_cashout_inflow_count": pl.Int64(),
+    "direct_complaint_count": pl.Int64(),
+    "pass_through_utrs": pl.List(pl.String()),
+    "smurf_utrs": pl.List(pl.String()),
+    "first_txn_timestamp": pl.Datetime("us"),
+    "last_txn_timestamp": pl.Datetime("us"),
+}
+
+GRAPH_INDICATOR_SCHEMA: dict[str, pl.DataType] = {
+    "account_no": pl.String(),
+    "pagerank": pl.Float64(),
+    "betweenness_centrality": pl.Float64(),
+    "louvain_community_id": pl.Int64(),
+    "cycle_count": pl.Int64(),
+    "cycle_max_amount": pl.Float64(),
+    "cycle_txn_ids": pl.List(pl.String()),
+    "complaint_link_count": pl.Int64(),
+    "complaint_ack_nos": pl.List(pl.String()),
+    "trail_taint_max": pl.Float64(),
+    "trail_hops_max": pl.Int64(),
+    "terminal_chain_count": pl.Int64(),
+}
+
+RISK_REPORT_SCHEMA: dict[str, pl.DataType] = {
+    "account_no": pl.String(),
+    "risk_score": pl.Float64(),
+    "domain_score": pl.Float64(),
+    "anomaly_score": pl.Float64(),
+    "risk_band": pl.String(),
+    "top_reasons": pl.List(pl.String()),
+    "explanation_kinds": pl.List(pl.String()),
+    "evidence_txn_ids": pl.List(pl.String()),
+}
+
+RISK_DISCLAIMER: str = (
+    "Risk score is an investigative lead-ranking aid computed from observed "
+    "ledger behaviour. It is not a probability of guilt, not legal evidence, "
+    "and not a substitute for human investigation."
+)
+
+# Monetary comparison tolerance (rupees). Used wherever a computed monetary
+# value is compared against a limit or against another monetary value.
+MONEY_EPSILON: float = 1e-6
+
+
+class FeatureConfig(BaseModel):
+    """Configurable thresholds for the behavioural feature extractor."""
+
+    pass_through_window_minutes: int = Field(default=15, ge=1, le=1440)
+    fan_out_window_minutes: int = Field(default=60, ge=1, le=1440)
+    dormancy_threshold_days: int = Field(default=180, ge=0)
+    burst_amount_threshold: float = Field(default=25_000.0, gt=0)
+    smurf_bulk_threshold: float = Field(default=50_000.0, gt=0)
+    smurf_min_splits: int = Field(default=8, ge=1)
+    smurf_split_min: float = Field(default=5_000.0, ge=0)
+    smurf_split_max: float = Field(default=9_999.99, gt=0)
+    aggregator_min_senders: int = Field(default=10, ge=1)
+    branch_cohort_hours: int = Field(default=48, ge=1)
+    terminal_modes: tuple[str, ...] = ("AEPS", "ATM", "CASH")
+    burst_window_hours: int = Field(default=24, ge=1)
+
+
+class GraphConfig(BaseModel):
+    """Configurable limits for graph tracing, cycle detection and correlation."""
+
+    max_hops: int = Field(default=3, ge=1, le=6)
+    cycle_max_length: int = Field(default=5, ge=3, le=5)
+    cycle_window_hours: int = Field(default=24, ge=1)
+    cycle_max_decay: float = Field(default=0.15, ge=0.0, le=1.0)
+    community_seed: int = 42
+    # How far back a complaint-scoped trace looks for the disputed transfer when
+    # the complaint names no suspect.
+    complaint_lookback_hours: int = Field(default=24, ge=1)
+    # Exact betweenness is O(V*E); `betweenness_k` switches to networkx's
+    # deterministic sampled approximation (k sampled source nodes).
+    betweenness_k: int | None = None
+    pagerank_alpha: float = Field(default=0.85, gt=0.0, lt=1.0)
+    trail_window_hours: int = Field(default=168, ge=1)
+
+
+class RiskConfig(BaseModel):
+    """Configurable weights and thresholds for the hybrid risk engine."""
+
+    domain_weight: float = Field(default=0.70, ge=0.0, le=1.0)
+    anomaly_weight: float = Field(default=0.30, ge=0.0, le=1.0)
+    pass_through_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    pass_through_weight: float = Field(default=25.0, ge=0.0)
+    smurfing_weight: float = Field(default=20.0, ge=0.0)
+    cycle_weight: float = Field(default=20.0, ge=0.0)
+    shared_metadata_weight: float = Field(default=10.0, ge=0.0)
+    terminal_cashout_weight: float = Field(default=10.0, ge=0.0)
+    complaint_weight: float = Field(default=15.0, ge=0.0)
+    shared_device_threshold: int = Field(default=1, ge=0)
+    branch_cohort_threshold: int = Field(default=2, ge=0)
+    terminal_cashout_threshold: int = Field(default=2, ge=0)
+    complaint_link_threshold: int = Field(default=1, ge=0)
+    cycle_threshold: int = Field(default=1, ge=0)
+    min_rows_for_anomaly: int = Field(default=10, ge=1)
+    max_explanations: int = Field(default=3, ge=1, le=10)
+    high_risk_band: float = Field(default=70.0, ge=0.0, le=100.0)
+    medium_risk_band: float = Field(default=40.0, ge=0.0, le=100.0)
+    # Mirrors the feature extractor's thresholds; used to phrase the applied
+    # threshold in the explanation text.
+    pass_through_window_minutes: int = Field(default=15, ge=1)
+    smurf_min_splits: int = Field(default=8, ge=1)
+    smurf_split_max: float = Field(default=9_999.99, gt=0)
+    branch_cohort_hours: int = Field(default=48, ge=1)
+
+    @property
+    def total_domain_weight(self) -> float:
+        return (
+            self.pass_through_weight
+            + self.smurfing_weight
+            + self.cycle_weight
+            + self.shared_metadata_weight
+            + self.terminal_cashout_weight
+            + self.complaint_weight
+        )
+
+
+class MoneyTrailLeg(BaseModel):
+    """One transaction leg on a traced money trail, with its taint share.
+
+    `taint_amount` is the part of *this* transaction that is attributable to
+    the traced funds. It can never exceed the transaction's own amount.
+    """
+
+    hop: int = Field(ge=1)
+    txn_id: str
+    sender_account: str
+    receiver_account: str
+    amount: float = Field(ge=0)
+    timestamp: datetime
+    payment_mode: str
+    taint_amount: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _taint_within_amount(self) -> MoneyTrailLeg:
+        if self.taint_amount > self.amount + MONEY_EPSILON:
+            raise ValueError(
+                f"taint_amount {self.taint_amount} exceeds the transaction "
+                f"amount {self.amount} for txn {self.txn_id}"
+            )
+        return self
+
+
+class MoneyTrail(BaseModel):
+    """A bounded, temporally ordered forward trace of disputed funds.
+
+    Accounting semantics: tainted funds are held by an account as a *tainted
+    balance* and are drawn down first-in-first-out as that account's
+    outgoing transactions are processed in chronological order. A transaction
+    therefore carries at most the tainted funds the sender actually held when
+    the transfer happened, and never more than the transfer's own amount.
+
+    `total_taint` is the tainted amount that left the origin (the sum of the
+    first-hop legs). Taint that was not propagated forward stays with the
+    account that held it and is reported nowhere else: it is never invented
+    into a downstream transfer.
+    """
+
+    origin_account: str
+    origin_amount: float = Field(ge=0)
+    origin_txn_id: str | None = None
+    max_hops: int = Field(ge=1, le=6)
+    legs: list[MoneyTrailLeg] = Field(default_factory=list)
+    reached_accounts: list[str] = Field(default_factory=list)
+    account_taint: dict[str, float] = Field(default_factory=dict)
+    total_taint: float = Field(ge=0)
+
+    @property
+    def taint_conserved(self) -> bool:
+        """No attributed taint may exceed the originating amount or the
+        amount of the transaction that carries it."""
+        if self.total_taint > self.origin_amount + MONEY_EPSILON:
+            return False
+        if any(
+            leg.taint_amount > leg.amount + MONEY_EPSILON for leg in self.legs
+        ):
+            return False
+        if any(
+            amount > self.origin_amount + MONEY_EPSILON
+            for amount in self.account_taint.values()
+        ):
+            return False
+        first_hop = sum(
+            leg.taint_amount for leg in self.legs if leg.hop == 1
+        )
+        return abs(first_hop - self.total_taint) <= MONEY_EPSILON
+
+
+class WashCycle(BaseModel):
+    """A closed directed money cycle with monotone amount decay."""
+
+    cycle_accounts: list[str]
+    txn_ids: list[str]
+    amounts: list[float]
+    timestamps: list[datetime]
+    start_timestamp: datetime
+    end_timestamp: datetime
+    total_amount: float = Field(ge=0)
+    max_decay_ratio: float = Field(ge=0.0)
+
+
+class ComplaintLink(BaseModel):
+    """Two NCRP cases linked by ledger/device/terminal evidence."""
+
+    ack_no_a: str
+    ack_no_b: str
+    state_a: str
+    state_b: str
+    shared_accounts: list[str] = Field(default_factory=list)
+    shared_device_ids: list[str] = Field(default_factory=list)
+    shared_terminal_accounts: list[str] = Field(default_factory=list)
+    link_basis: str = Field(min_length=1)
+
+
+class RiskExplanation(BaseModel):
+    """One investigator-facing explanation line, typed as fact or inference."""
+
+    kind: str = Field(min_length=1)          # "FACT" or "INDICATOR"
+    indicator: str = Field(min_length=1)
+    measured_value: float | None = None
+    threshold: float | None = None
+    points: float = 0.0
+    detail: str = Field(min_length=1)
+    evidence_txn_ids: list[str] = Field(default_factory=list)
+
+
+class RiskAssessment(BaseModel):
+    """Full risk assessment for one account (frame row + typed detail)."""
+
+    account_no: str
+    risk_score: float = Field(ge=0.0, le=100.0)
+    domain_score: float = Field(ge=0.0, le=100.0)
+    anomaly_score: float = Field(ge=0.0, le=100.0)
+    risk_band: str
+    explanations: list[RiskExplanation] = Field(default_factory=list)
+    disclaimer: str = RISK_DISCLAIMER
