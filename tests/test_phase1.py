@@ -1,7 +1,8 @@
 """Phase 1 acceptance tests: contracts, fuzzy ingestion, deterministic simulator."""
 import io
 import json
-from datetime import date, datetime
+import re
+from datetime import date, datetime, timedelta
 
 import openpyxl
 import polars as pl
@@ -687,7 +688,19 @@ class TestIngestMultiTableRejections:
         assert df.height == 0
 
 
-from simulator.generator import LABELED_TRANSACTION_SCHEMA, SyndicateDataSimulator
+from simulator.generator import (
+    LABELED_TRANSACTION_SCHEMA,
+    SCHEME_AEPS_TERMINAL_CASH_OUT,
+    SCHEME_BRANCH_COLLUSION,
+    SCHEME_CIRCULAR_WASH,
+    SCHEME_FAN_OUT_SMURFING,
+    SCHEME_RAPID_PASS_THROUGH,
+    SCHEME_TXN_COUNTS,
+    SHARED_BRANCH_IMEI,
+    TERMINAL_MERCHANT_ACCOUNT,
+    SimulationResult,
+    SyndicateDataSimulator,
+)
 
 
 class TestSimulatorBackground:
@@ -705,7 +718,7 @@ class TestSimulatorBackground:
         result = SyndicateDataSimulator(seed=42).generate()
         assert result.transactions.columns == list(LABELED_TRANSACTION_SCHEMA)
         assert result.accounts.columns == list(ACCOUNT_METADATA_SCHEMA)
-        assert result.accounts.height == 1000
+        assert result.accounts.height == 1274
         assert result.transactions.dtypes == [
             LABELED_TRANSACTION_SCHEMA[c] for c in result.transactions.columns
         ]
@@ -747,3 +760,188 @@ class TestSimulatorBackground:
         a = SyndicateDataSimulator(seed=42).generate(background_transactions=5_000)
         b = SyndicateDataSimulator(seed=7).generate(background_transactions=5_000)
         assert not a.transactions.equals(b.transactions)
+
+
+_TERMINAL_ACCOUNT = TERMINAL_MERCHANT_ACCOUNT   # single source of truth lives in the generator
+_SHARED_IMEI = SHARED_BRANCH_IMEI
+
+
+def accounts_set(sim: SimulationResult) -> set[str]:
+    return set(sim.accounts["account_no"].to_list())
+
+
+class TestSchemes:
+    @pytest.fixture()
+    def sim(self) -> SimulationResult:
+        return SyndicateDataSimulator(seed=42).generate(background_transactions=5_000)
+
+    def test_labeled_counts_exact(self, sim) -> None:
+        got = {
+            row["fraud_scheme"]: row["len"]
+            for row in sim.transactions.group_by("fraud_scheme").len().to_dicts()
+        }
+        labeled = {k: v for k, v in got.items() if k is not None}
+        assert labeled == SCHEME_TXN_COUNTS
+
+    def test_total_rows_match_background_plus_schemes(self, sim) -> None:
+        assert sim.transactions.height == 5_000 + sum(SCHEME_TXN_COUNTS.values())
+
+    def test_labels_integrity(self, sim) -> None:
+        t = sim.transactions
+        matches = t.select(
+            (pl.col("is_fraud") == pl.col("fraud_scheme").is_not_null()).all()
+        ).item()
+        assert bool(matches)
+
+    def test_no_orphaned_or_letter_coded_accounts(self, sim) -> None:
+        # Decision 13: every emitted sender/receiver — background and all five
+        # schemes — resolves to a master row; ids are numeric only.
+        t = sim.transactions
+        used = set(t["sender_account"].to_list()) | set(t["receiver_account"].to_list())
+        assert used <= accounts_set(sim)
+        assert not any(re.search(r"[A-Za-z]", account) for account in used)
+        assert sim.accounts.height == 1_274          # 1000 base + 273 scheme + 1 merchant
+
+    def test_rapid_pass_through_drain_window_hub_age(self, sim) -> None:
+        t = sim.transactions.filter(pl.col("fraud_scheme") == SCHEME_RAPID_PASS_THROUGH)
+        assert t.height == 80
+        for e in range(20):
+            rows = t.filter(
+                pl.col("txn_id").str.starts_with(f"S1-{e:03d}-")
+            ).sort("txn_id")
+            inflow = rows.filter(pl.col("txn_id").str.ends_with("-0"))["amount"].item()
+            hops = rows.filter(~pl.col("txn_id").str.ends_with("-0"))
+            drain = hops["amount"].sum() / inflow
+            assert drain >= 0.90, (e, drain)
+            window = hops["timestamp"].max() - rows["timestamp"].min()
+            assert window <= timedelta(minutes=15)
+            assert hops.height == 3
+            # roles derived structurally: the inflow leg's receiver IS the hub
+            hub = t.filter(pl.col("txn_id") == f"S1-{e:03d}-0")["receiver_account"].item()
+            hub_sent = rows.filter(pl.col("sender_account") == hub)
+            assert hub_sent["amount"].sum() <= inflow  # hub can't spend its inflow twice
+            # attribute truth for Phase 2 (Decision 13): hub account is aged, low-tier
+            hub_row = sim.accounts.filter(pl.col("account_no") == hub)
+            assert hub_row.height == 1
+            opened = hub_row["account_opening_date"].item()
+            assert opened <= date(2024, 6, 1) - timedelta(days=180)
+            assert hub_row["account_type"].item() in ("PMJDY", "SAVINGS")
+
+    def test_fan_out_smurfing_micro_amounts(self, sim) -> None:
+        t = sim.transactions.filter(pl.col("fraud_scheme") == SCHEME_FAN_OUT_SMURFING)
+        for e in range(10):
+            episode = t.filter(pl.col("txn_id").str.starts_with(f"S2-{e:03d}-"))
+            inflow = episode.filter(pl.col("txn_id").str.ends_with("-0"))
+            assert inflow.height == 1
+            coll = inflow["receiver_account"].item()          # structural collector id
+            micro = episode.filter(~pl.col("txn_id").str.ends_with("-0"))
+            assert micro.height == 12
+            assert (micro["sender_account"] == coll).all()    # collector emits all micro-sends
+            assert micro["receiver_account"].n_unique() == 12
+            assert (micro["amount"] < 10_000).all()
+
+    def test_aeps_terminal_cash_out_common_point(self, sim) -> None:
+        t = sim.transactions.filter(pl.col("fraud_scheme") == SCHEME_AEPS_TERMINAL_CASH_OUT)
+        inbound = t.filter(pl.col("receiver_account") == _TERMINAL_ACCOUNT)
+        assert inbound.height == 3
+        assert (inbound["payment_mode"] == "AEPS").all()
+        assert (inbound["device_id"] == "AEPSDEV000001").all()
+        for trail in range(3):
+            # role derivation: leg 0 is victim->tier1, leg 1 tier1->tier2, leg 2 tier2->terminal
+            episode = t.filter(
+                pl.col("txn_id").str.starts_with(f"S3-{trail:02d}-")
+            ).sort("txn_id")
+            senders = episode["sender_account"].to_list()
+            receivers = episode["receiver_account"].to_list()
+            victim, tier1, tier2 = senders[0], receivers[0], senders[2]
+            assert receivers[1] == tier2
+            assert tier1 not in {victim, tier2}
+            actors = {victim, tier1, tier2, _TERMINAL_ACCOUNT}
+            assert actors <= accounts_set(sim)
+
+    def test_branch_collusion_accounts_and_device(self, sim) -> None:
+        colluders = sim.accounts.filter(pl.col("imei") == _SHARED_IMEI)
+        assert colluders.height == 6
+        assert (colluders["ifsc"] == "SBIN0000421").all()
+        assert (colluders["branch_code"] == "BR042").all()
+        opens = colluders["account_opening_date"].to_list()
+        assert max(opens) - min(opens) <= timedelta(days=2)
+        for mob in colluders["mobile_no"].to_list():
+            assert mob.startswith("9162")
+        t = sim.transactions.filter(pl.col("fraud_scheme") == SCHEME_BRANCH_COLLUSION)
+        assert t.height == 12
+        assert (t["device_id"] == _SHARED_IMEI).all()
+        colluder_set = set(colluders["account_no"].to_list())
+        for row in t.to_dicts():
+            assert row["sender_account"] in colluder_set
+            assert row["receiver_account"] in colluder_set
+
+    def test_circular_wash_closed_loop(self, sim) -> None:
+        t = sim.transactions.filter(pl.col("fraud_scheme") == SCHEME_CIRCULAR_WASH)
+        assert t.height == 18
+        for loop in range(6):
+            episode = t.filter(
+                pl.col("txn_id").str.starts_with(f"S5-{loop:02d}-")   # builder pads 2 digits
+            ).sort("txn_id")
+            edges = episode.to_dicts()      # legs commute in txn_id order: 0,1,2
+            assert edges[1]["sender_account"] == edges[0]["receiver_account"]   # A->B, B->C
+            assert edges[2]["sender_account"] == edges[1]["receiver_account"]   # then C->...
+            assert edges[0]["sender_account"] == edges[2]["receiver_account"]   # ...->A (closed)
+            amounts = [edge["amount"] for edge in edges]
+            assert amounts[0] > amounts[1] > amounts[2]      # 3% commission decay
+            actors = {
+                edge["sender_account"] for edge in edges
+            } | {
+                edge["receiver_account"] for edge in edges
+            }
+            assert actors <= accounts_set(sim)
+            assert len(actors) == 3
+
+    def test_invalid_background_transaction_count_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            SyndicateDataSimulator().generate(background_transactions=1)
+
+
+class TestComplaints:
+    @pytest.fixture()
+    def sim(self) -> SimulationResult:
+        return SyndicateDataSimulator(seed=42).generate(background_transactions=5_000)
+
+    def test_complaint_ground_truth_joins(self, sim) -> None:
+        c = sim.complaints
+        assert c.height == 16
+        assert c.columns == list(COMPLAINT_SCHEMA)
+        assert c["ack_no"].n_unique() == 16
+        assert c["disputed_utr"].null_count() == 0
+        named_states = set(c["state"].to_list())
+        assert named_states == {"Bihar", "Delhi", "Maharashtra", "Tamil Nadu", "Jharkhand"}
+        joined = c.join(
+            sim.transactions.select(["txn_id", "sender_account", "receiver_account"]),
+            left_on="disputed_utr", right_on="txn_id",
+            how="left",
+        )
+        # polars drops the right join key (`txn_id`) in this join shape, so
+        # matched-ness is asserted via the joined data columns:
+        assert joined["sender_account"].null_count() == 0
+        assert joined["receiver_account"].null_count() == 0
+        # every complaint cites a real transaction, and victim/suspect are
+        # exactly that disputable leg's sender/receiver (Decision 14):
+        assert (joined["victim_account"] == joined["sender_account"]).all()
+        assert (joined["suspect_account"] == joined["receiver_account"]).all()
+
+    def test_complaints_per_scheme(self, sim) -> None:
+        c = sim.complaints
+        joined = c.join(
+            sim.transactions.select(["txn_id", "fraud_scheme"]),
+            left_on="disputed_utr", right_on="txn_id",
+            how="left",
+        )
+        scheme_counts = {
+            str(row["fraud_scheme"]): row["len"]
+            for row in joined.group_by("fraud_scheme").len().to_dicts()
+        }
+        assert scheme_counts == {
+            SCHEME_RAPID_PASS_THROUGH: 8,
+            SCHEME_FAN_OUT_SMURFING: 5,
+            SCHEME_AEPS_TERMINAL_CASH_OUT: 3,
+        }
