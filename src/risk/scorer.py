@@ -31,6 +31,7 @@ from sklearn.ensemble import IsolationForest
 
 from core.contracts import (
     ACCOUNT_FEATURE_SCHEMA,
+    DOMAIN_KEYS,
     GRAPH_INDICATOR_SCHEMA,
     RISK_DISCLAIMER,
     RISK_REPORT_SCHEMA,
@@ -38,6 +39,16 @@ from core.contracts import (
     RiskConfig,
     RiskExplanation,
 )
+
+ARCHETYPE_LABELS: dict[str, str] = {
+    "pass_through": "Rapid pass-through mule",
+    "smurfing": "Structuring / fan-out mule",
+    "cycle": "Circular wash participant",
+    "shared_metadata": "Shared-KYC collusion ring",
+    "terminal_cashout": "Terminal cash-out point",
+    "complaint": "Complaint-linked mule",
+}
+ARCHETYPE_NONE: str = "No domain indicator"
 
 # Numeric behavioural features used by the anomaly model. Ground-truth labels
 # (`is_fraud`, `fraud_scheme`) and protected attributes (`account_type`,
@@ -145,6 +156,14 @@ class RiskScorer:
         """Typed per-account assessments (same computation as `score`)."""
         _, assessments = self._evaluate(features, graph)
         return assessments
+
+    def score_with_assessments(
+        self,
+        features: pl.DataFrame,
+        graph: pl.DataFrame | None = None,
+    ) -> tuple[pl.DataFrame, list[RiskAssessment]]:
+        """Risk report and typed assessments from one fitted model."""
+        return self._evaluate(features, graph)
 
     # --- computation ------------------------------------------------------
 
@@ -278,6 +297,14 @@ class RiskScorer:
         kinds: list[list[str]] = []
         evidence: list[list[str]] = []
         assessments: list[RiskAssessment] = []
+        component_columns = {
+            "pass_through": ("_pass_through", cfg.pass_through_weight),
+            "smurfing": ("_smurfing", cfg.smurfing_weight),
+            "cycle": ("_cycle", cfg.cycle_weight),
+            "shared_metadata": ("_shared", cfg.shared_metadata_weight),
+            "terminal_cashout": ("_terminal", cfg.terminal_cashout_weight),
+            "complaint": ("_complaint", cfg.complaint_weight),
+        }
         for index, row in enumerate(rows):
             explanations = self._explain(row, index, shap_values, matrix)
             reasons.append([item.detail for item in explanations])
@@ -288,6 +315,16 @@ class RiskScorer:
                     if txn_id not in cited:
                         cited.append(txn_id)
             evidence.append(cited)
+            components = {
+                key: round(float(row[column]) * 100.0, 4)
+                for key, (column, _) in component_columns.items()
+            }
+            points = {
+                key: component_columns[key][1] * components[key] / 100.0
+                for key in DOMAIN_KEYS
+            }
+            best = max(DOMAIN_KEYS, key=lambda key: (points[key], -DOMAIN_KEYS.index(key)))
+            top = ARCHETYPE_LABELS[best] if points[best] > 0 else ARCHETYPE_NONE
             assessments.append(
                 RiskAssessment(
                     account_no=str(row["account_no"]),
@@ -296,6 +333,8 @@ class RiskScorer:
                     anomaly_score=float(row["_anomaly_score"]),
                     risk_band=self._band(float(row["_risk_score"])),
                     explanations=explanations,
+                    domain_components=components,
+                    top_archetype=top,
                 )
             )
 

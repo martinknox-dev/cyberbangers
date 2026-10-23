@@ -409,4 +409,134 @@ class RiskAssessment(BaseModel):
     anomaly_score: float = Field(ge=0.0, le=100.0)
     risk_band: str
     explanations: list[RiskExplanation] = Field(default_factory=list)
+    domain_components: dict[str, float] = Field(default_factory=dict)  # 0..100 each
+    top_archetype: str = ""
     disclaimer: str = RISK_DISCLAIMER
+
+
+# --- Phase 3: case dossier ---------------------------------------------------
+DossierFactCategory = Literal["ACCOUNT", "TRANSACTION", "COMPLAINT", "SHARED_KYC"]
+DossierMethod = Literal["DOMAIN_RULE", "ISOLATION_FOREST_SHAP", "FIFO_TAINT", "TOPOLOGY"]
+DossierScope = Literal["ACCOUNT", "CLUSTER", "COMPLAINT"]
+DomainKey = Literal["pass_through", "smurfing", "cycle", "shared_metadata",
+                    "terminal_cashout", "complaint"]
+
+DOMAIN_LABELS: dict[str, str] = {
+    "pass_through": "Rapid pass-through",
+    "smurfing": "Structuring / fan-out",
+    "cycle": "Circular wash",
+    "shared_metadata": "Shared KYC / branch ring",
+    "terminal_cashout": "Terminal cash-out",
+    "complaint": "Complaint linkage",
+    "anomaly": "ML anomaly (IsolationForest)",
+}
+DOMAIN_KEYS: tuple[str, ...] = (
+    "pass_through", "smurfing", "cycle", "shared_metadata",
+    "terminal_cashout", "complaint",
+)
+
+BNSS_SECTION_94: str = (
+    "Section 94 of the Bharatiya Nagarik Suraksha Sanhita, 2023 (BNSS)"
+)
+BNSS_SECTION_106: str = "Section 106 of the Bharatiya Nagarik Suraksha Sanhita, 2023 (BNSS)"
+
+DOSSIER_DISCLAIMER: str = (
+    "Section A reproduces records supplied by the source systems and is not a "
+    "certified copy. Section B is analytical output of an automated model: it "
+    "is an investigative lead, not evidence and not a probability of guilt. "
+    "Section C is a draft requisition for review and signature by the competent "
+    "investigating officer; it is not legal advice and does not by itself "
+    "authorise lien marking, freezing or seizure."
+)
+
+REQUISITION_DOCUMENTS: tuple[str, ...] = (
+    "Certified copy of the account opening form (AOF) and KYC documents",
+    (
+        "Customer master details, including registered mobile number, e-mail, "
+        "PAN (if recorded) and introducer details"
+    ),
+    (
+        "Certified account statement covering every transaction reference listed "
+        "against this bank"
+    ),
+    (
+        "IP address, device identifier/IMEI and login/access logs for the listed "
+        "transaction references"
+    ),
+    "Branch and opening-official details for the listed accounts",
+    "Current account status (active/frozen/closed) and any lien already marked",
+)
+
+
+class DossierFact(BaseModel):
+    """Section A: one verifiable record, tied to its source."""
+
+    category: DossierFactCategory
+    label: str = Field(min_length=1)
+    value: str = Field(min_length=1)
+    source: Literal["ledger", "account_master", "ncrp", "generator"]
+    account_no: str | None = None
+    txn_id: str | None = None
+    ack_no: str | None = None
+    timestamp: datetime | None = None
+    amount: float | None = None
+
+
+class DossierSubScore(BaseModel):
+    domain: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    value: float = Field(ge=0.0, le=100.0)
+    weight: float = Field(ge=0.0)
+    points: float = Field(ge=0.0)
+
+
+class DossierIndicator(BaseModel):
+    """Section B: one analytical measurement. Never evidence."""
+
+    indicator: str = Field(min_length=1)
+    method: DossierMethod
+    value: float
+    unit: Literal["score", "ratio", "count", "rupees"] = "score"
+    threshold: float | None = None
+    points: float = 0.0
+    explanation: str = Field(min_length=1)
+    txn_ids: list[str] = Field(default_factory=list)
+
+
+class RequisitionRequest(BaseModel):
+    bank_name: str = Field(min_length=1)
+    ifsc_prefix: str = Field(min_length=4, max_length=12)
+    accounts: list[str] = Field(default_factory=list)
+    utrs: list[str] = Field(default_factory=list)
+    documents: list[str] = Field(default_factory=list)
+
+
+class DossierRequisition(BaseModel):
+    statute_reference: str = Field(min_length=1)
+    addressee: str = Field(min_length=1)
+    subject: str = Field(min_length=1)
+    case_reference: str = Field(min_length=1)
+    paragraphs: list[str] = Field(default_factory=list)
+    bank_requests: list[RequisitionRequest] = Field(default_factory=list)
+    legal_note: str = Field(min_length=1)
+
+
+class DossierRiskSummary(BaseModel):
+    account_no: str
+    risk_score: float = Field(ge=0.0, le=100.0)
+    domain_score: float = Field(ge=0.0, le=100.0)
+    anomaly_score: float = Field(ge=0.0, le=100.0)
+    risk_band: str
+    top_archetype: str
+    sub_scores: list[DossierSubScore] = Field(default_factory=list)
+
+
+class InvestigationDossier(BaseModel):
+    case_reference: str = Field(min_length=1)
+    scope: DossierScope
+    subject_accounts: list[str] = Field(default_factory=list)
+    facts: list[DossierFact] = Field(default_factory=list)
+    indicators: list[DossierIndicator] = Field(default_factory=list)
+    risk_summary: DossierRiskSummary | None = None
+    requisition: DossierRequisition
+    disclaimer: str = DOSSIER_DISCLAIMER
