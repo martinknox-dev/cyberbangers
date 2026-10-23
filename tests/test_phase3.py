@@ -29,7 +29,15 @@ from export.dossier import (
 )
 from ingestion.mapper import DatasetIngester
 from risk.scorer import RiskScorer
-from ui.state import build_ingestion_view, build_leaderboard, run_pipeline
+from ui.state import (
+    build_account_detail,
+    build_account_dossier,
+    build_cluster_dossier,
+    build_complaint_dossier,
+    build_ingestion_view,
+    build_leaderboard,
+    run_pipeline,
+)
 
 BASE = datetime(2024, 6, 1, 10, 0)
 
@@ -448,3 +456,69 @@ def test_ingestion_view_summarises_failures_and_mappings() -> None:
     assert mapped["UTR"].confidence == 1.0
     assert mapped["Txn Date"].canonical_name == "timestamp"
     assert view.total_rejected == 2 and view.total_rows == 3
+
+
+def test_account_dossier_facts_and_indicators_are_separated() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    dossier = build_account_dossier(bundle, "HUB")
+    assert dossier.scope == "ACCOUNT"
+    assert dossier.subject_accounts == ["HUB"]
+    assert any(fact.txn_id == "T1" for fact in dossier.facts)
+    assert any(indicator.method == "FIFO_TAINT" for indicator in dossier.indicators)
+    assert dossier.risk_summary is not None
+    assert dossier.risk_summary.account_no == "HUB"
+    assert all(fact.source != "ledger" or fact.txn_id for fact in dossier.facts)
+
+
+def test_account_detail_exposes_seven_sub_scores_and_a_chronological_timeline() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    detail = build_account_detail(bundle, "HUB")
+    assert [score.domain for score in detail.sub_scores][:6] == list(DOMAIN_KEYS)
+    assert detail.sub_scores[-1].domain == "anomaly"
+    assert [row.txn_id for row in detail.timeline] == ["T0", "T1", "T2"]
+    assert [row.direction for row in detail.timeline] == ["IN", "IN", "OUT"]
+    assert detail.metadata["ifsc"] == "UTIB0000123"
+
+
+def test_complaint_dossier_does_not_list_unrelated_victim_spending() -> None:
+    transactions, accounts, complaints = _pipeline_frames()
+    transactions = pl.concat([
+        transactions,
+        pl.DataFrame([_txn("V-LEGIT", "V", "SHOP2", 700.0, 30)],
+                     schema=TRANSACTION_SCHEMA),
+    ])
+    bundle = run_pipeline(transactions, accounts, complaints)
+    dossier = build_complaint_dossier(bundle, "ACK1")
+    assert dossier.scope == "COMPLAINT"
+    assert "V-LEGIT" not in [fact.txn_id for fact in dossier.facts]
+    assert "T1" in [fact.txn_id for fact in dossier.facts]
+    assert "ACK1" in [fact.ack_no for fact in dossier.facts]
+
+
+def test_complaint_dossier_without_utr_uses_the_suspect_leg() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    dossier = build_complaint_dossier(bundle, "ACK2")
+    # ACK2 has no disputed_utr: the inferred origin is V2's leg to the named suspect
+    assert "T0" in [fact.txn_id for fact in dossier.facts]
+    assert "ACK2" in [fact.ack_no for fact in dossier.facts]
+    assert dossier.indicators          # trail-based indicators exist
+
+
+def test_unknown_account_and_ack_produce_valid_empty_documents() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    ghost = build_account_dossier(bundle, "NO-SUCH-ACCOUNT")
+    assert ghost.subject_accounts == ["NO-SUCH-ACCOUNT"]
+    assert ghost.facts and ghost.facts[0].source == "generator"
+    missing = build_complaint_dossier(bundle, "ACK-NOT-THERE")
+    assert missing.scope == "COMPLAINT" and missing.facts == []
+
+
+def test_cluster_dossier_covers_every_selected_account() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    dossier = build_cluster_dossier(bundle, ["M2", "HUB"])
+    assert dossier.scope == "CLUSTER"
+    assert dossier.subject_accounts == ["HUB", "M2"]
+    account_facts = [fact for fact in dossier.facts if fact.category == "ACCOUNT"]
+    assert [fact.account_no for fact in account_facts] == ["HUB", "M2"]
+    assert dossier.risk_summary is not None
+    assert dossier.risk_summary.account_no == "HUB"      # highest score
