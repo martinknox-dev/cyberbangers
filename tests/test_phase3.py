@@ -8,9 +8,12 @@ import polars as pl
 
 from core.contracts import (
     ACCOUNT_FEATURE_SCHEMA,
+    ACCOUNT_METADATA_SCHEMA,
+    COMPLAINT_SCHEMA,
     DOMAIN_KEYS,
     GRAPH_INDICATOR_SCHEMA,
     REQUISITION_DOCUMENTS,
+    TRANSACTION_SCHEMA,
     IngestionReport,
     InvestigationDossier,
     MoneyTrail,
@@ -24,7 +27,9 @@ from export.dossier import (
     format_inr,
     rejected_rows_csv,
 )
+from ingestion.mapper import DatasetIngester
 from risk.scorer import RiskScorer
+from ui.state import build_ingestion_view, build_leaderboard, run_pipeline
 
 BASE = datetime(2024, 6, 1, 10, 0)
 
@@ -372,3 +377,74 @@ def test_values_are_escaped_in_html_and_markdown() -> None:
     widths = {line.count("|") - line.count("\\|") for line in table_rows}
     assert len(widths) == 1                 # no value can break the table structure
     assert "BR\\|042" in markdown           # the pipe is escaped, not dropped
+
+
+def _pipeline_frames() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    transactions = pl.DataFrame([
+        _txn("T0", "V2", "HUB", 50_000.0, -10),
+        _txn("T1", "V", "HUB", 100_000.0, 0),
+        _txn("T2", "HUB", "M2", 95_000.0, 5),
+        _txn("T3", "M2", "TERM", 93_000.0, 10, mode="AEPS"),
+        _txn("T4", "OTHER", "SHOP", 500.0, 20),
+    ], schema=TRANSACTION_SCHEMA)
+    accounts = pl.DataFrame([_account_row("HUB"), _account_row("M2"),
+                             _account_row("TERM")], schema=ACCOUNT_METADATA_SCHEMA)
+    complaints = pl.DataFrame([
+        {"ack_no": "ACK1", "victim_account": "V", "suspect_account": "HUB",
+         "fraud_category": "UPI_FRAUD", "reported_timestamp": BASE + timedelta(hours=1),
+         "disputed_amount": 100_000.0, "disputed_utr": "T1", "state": "Bihar"},
+        {"ack_no": "ACK2", "victim_account": "V2", "suspect_account": "HUB",
+         "fraud_category": "UPI_FRAUD", "reported_timestamp": BASE + timedelta(hours=2),
+         "disputed_amount": 50_000.0, "disputed_utr": None, "state": "Jharkhand"},
+    ], schema=COMPLAINT_SCHEMA)
+    return transactions, accounts, complaints
+
+
+def test_pipeline_is_deterministic_and_reuses_phase2_layers() -> None:
+    frames = _pipeline_frames()
+    first = run_pipeline(*frames)
+    second = run_pipeline(*frames)
+    assert first.features.equals(second.features)
+    assert first.graph.equals(second.graph)
+    assert first.risk.equals(second.risk)
+    assert [a.account_no for a in first.assessments] == sorted(
+        a.account_no for a in first.assessments
+    )
+    assert first.wash_cycles == ()
+    assert first.complaint_links == ()
+
+
+def test_leaderboard_ranks_by_score_then_account() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    view = build_leaderboard(bundle)
+    scores = [row.risk_score for row in view.rows]
+    assert scores == sorted(scores, reverse=True)
+    assert view.rows[0].account_no == "HUB"
+    assert view.rows[0].risk_band
+    assert view.rows[0].top_archetype == "Rapid pass-through mule"
+    filtered = build_leaderboard(bundle, min_score=100.0)
+    assert filtered.rows == ()
+    assert filtered.total_accounts == len(bundle.assessments)
+
+
+def test_ingestion_view_summarises_failures_and_mappings() -> None:
+    csv_bytes = (
+        b"UTR,From Account,To Account,Amount,Txn Date,Mode\n"
+        b"T1,V,HUB,100,2024-06-01 10:00:00,upi\n"
+        b"T2,V,HUB,not-a-number,2024-06-01 10:05:00,upi\n"
+        b",V,HUB,50,2024-06-01 10:06:00,upi\n"
+    )
+    _, report = DatasetIngester().ingest_transactions(csv_bytes)
+    view = build_ingestion_view({"transactions": report})
+    table = view.tables[0]
+    assert table.table == "transactions"
+    assert (table.rows_total, table.rows_accepted, table.rows_rejected) == (3, 1, 2)
+    failures = dict(table.failure_counts)
+    assert failures["unparseable_amount"] == 1
+    assert failures["missing:txn_id"] == 1        # note the `missing:<column>` form
+    mapped = {row.raw_name: row for row in table.mappings}
+    assert mapped["UTR"].canonical_name == "txn_id"
+    assert mapped["UTR"].matched_synonym == "utr"
+    assert mapped["UTR"].confidence == 1.0
+    assert mapped["Txn Date"].canonical_name == "timestamp"
+    assert view.total_rejected == 2 and view.total_rows == 3
