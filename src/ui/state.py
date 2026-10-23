@@ -22,7 +22,6 @@ from core.contracts import (
     DossierScope,
     FeatureConfig,
     GraphConfig,
-    HardwareProfile,
     IngestionReport,
     InvestigationDossier,
     MoneyTrail,
@@ -30,7 +29,7 @@ from core.contracts import (
     RiskConfig,
     WashCycle,
 )
-from core.hardware import ComputeTier, detect_hardware_profile
+from core.hardware import ComputeTier, HardwareProfile, detect_hardware_profile
 from export.dossier import (
     DossierAccount,
     DossierConfig,
@@ -69,17 +68,26 @@ def run_pipeline(
     reports: Mapping[str, IngestionReport] | None = None,
     compute_tier: ComputeTier | None = None,
 ) -> PipelineBundle:
-    resolved_tier = compute_tier
+    resolved_feature = feature_config or FeatureConfig()
+    resolved_graph = graph_config or GraphConfig()
+    resolved_risk = risk_config or RiskConfig()
+    if compute_tier is not None:
+        resolved_feature = resolved_feature.model_copy(
+            update={"compute_tier": compute_tier}
+        )
+        resolved_graph = resolved_graph.model_copy(
+            update={"compute_tier": compute_tier}
+        )
+        resolved_risk = resolved_risk.model_copy(
+            update={"compute_tier": compute_tier}
+        )
     features = extract_account_features(
-        transactions, accounts, complaints, feature_config
+        transactions, accounts, complaints, resolved_feature
     )
     analyzer = GraphAnalyzer(
-        transactions, accounts, complaints, graph_config
+        transactions, accounts, complaints, resolved_graph
     )
     graph = analyzer.topology_metrics()
-    resolved_risk = risk_config or RiskConfig()
-    if resolved_tier is not None:
-        resolved_risk = resolved_risk.model_copy(update={"compute_tier": resolved_tier})
     scorer = RiskScorer(resolved_risk)
     risk, assessments = scorer.score_with_assessments(features, graph)
     return PipelineBundle(
@@ -101,7 +109,7 @@ def run_pipeline(
         complaint_links=tuple(analyzer.correlate_complaints()),
         reports=dict(reports or {}),
         risk_config=resolved_risk,
-        hardware_profile=detect_hardware_profile(resolved_tier),
+        hardware_profile=detect_hardware_profile(resolved_risk.compute_tier),
     )
 
 
@@ -173,6 +181,9 @@ class LeaderboardRow:
     top_archetype: str
     complaint_count: int
     top_reason: str
+    operational_role: str = "STANDARD_ACCOUNT"
+    retained_tainted_amount: float = 0.0
+    freeze_priority_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -220,6 +231,9 @@ def build_leaderboard(
             top_archetype=assessment.top_archetype,
             complaint_count=complaints.get(assessment.account_no, 0),
             top_reason=str(top[0]) if top else "",
+            operational_role=assessment.operational_role,
+            retained_tainted_amount=assessment.retained_tainted_amount,
+            freeze_priority_score=assessment.freeze_priority_score,
         ))
     rows.sort(key=lambda row: (-row.risk_score, row.account_no))
     return LeaderboardView(
@@ -442,6 +456,9 @@ class AccountDetailView:
     facts: tuple[DossierFact, ...]
     indicators: tuple[DossierIndicator, ...]
     dossier: InvestigationDossier
+    operational_role: str = "STANDARD_ACCOUNT"
+    retained_tainted_amount: float = 0.0
+    freeze_priority_score: float = 0.0
 
 
 def _metadata_text(value: object) -> str | None:
@@ -499,6 +516,21 @@ def build_account_detail(
         sub_scores=sub_scores, timeline=tuple(timeline),
         facts=tuple(dossier.facts), indicators=tuple(dossier.indicators),
         dossier=dossier,
+        operational_role=(
+            account.risk.operational_role
+            if account.risk is not None
+            else "STANDARD_ACCOUNT"
+        ),
+        retained_tainted_amount=(
+            account.risk.retained_tainted_amount
+            if account.risk is not None
+            else 0.0
+        ),
+        freeze_priority_score=(
+            account.risk.freeze_priority_score
+            if account.risk is not None
+            else 0.0
+        ),
     )
 
 

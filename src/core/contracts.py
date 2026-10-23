@@ -15,7 +15,7 @@ from typing import Literal
 import polars as pl
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from core.hardware import ComputeTier, HardwareProfile
+from core.hardware import ComputeTier
 
 PaymentMode = Literal["UPI", "IMPS", "NEFT", "RTGS", "AEPS", "ATM", "CASH"]
 AccountType = Literal["SAVINGS", "PMJDY", "CURRENT"]
@@ -175,6 +175,7 @@ ACCOUNT_FEATURE_SCHEMA: dict[str, pl.DataType] = {
     "branch_cohort_48h_count": pl.Int64(),
     "aeps_cashout_inflow_count": pl.Int64(),
     "direct_complaint_count": pl.Int64(),
+    "cohort_volume_zscore": pl.Float64(),
     "pass_through_utrs": pl.List(pl.String()),
     "smurf_utrs": pl.List(pl.String()),
     "first_txn_timestamp": pl.Datetime("us"),
@@ -194,6 +195,8 @@ GRAPH_INDICATOR_SCHEMA: dict[str, pl.DataType] = {
     "trail_taint_max": pl.Float64(),
     "trail_hops_max": pl.Int64(),
     "terminal_chain_count": pl.Int64(),
+    "retained_tainted_amount": pl.Float64(),
+    "network_proximity_risk": pl.Float64(),
 }
 
 RISK_REPORT_SCHEMA: dict[str, pl.DataType] = {
@@ -205,6 +208,9 @@ RISK_REPORT_SCHEMA: dict[str, pl.DataType] = {
     "top_reasons": pl.List(pl.String()),
     "explanation_kinds": pl.List(pl.String()),
     "evidence_txn_ids": pl.List(pl.String()),
+    "operational_role": pl.String(),
+    "retained_tainted_amount": pl.Float64(),
+    "freeze_priority_score": pl.Float64(),
 }
 
 RISK_DISCLAIMER: str = (
@@ -344,6 +350,10 @@ class MoneyTrail(BaseModel):
     legs: list[MoneyTrailLeg] = Field(default_factory=list)
     reached_accounts: list[str] = Field(default_factory=list)
     account_taint: dict[str, float] = Field(default_factory=dict)
+    # Tainted funds that arrived at an account but had not left it when the
+    # trace stopped (the FIFO residual). This is the potentially recoverable
+    # portion of the disputed amount at that account.
+    retained_taint: dict[str, float] = Field(default_factory=dict)
     total_taint: float = Field(ge=0)
 
     @property
@@ -416,6 +426,9 @@ class RiskAssessment(BaseModel):
     explanations: list[RiskExplanation] = Field(default_factory=list)
     domain_components: dict[str, float] = Field(default_factory=dict)  # 0..100 each
     top_archetype: str = ""
+    operational_role: str = "STANDARD_ACCOUNT"
+    retained_tainted_amount: float = Field(default=0.0, ge=0.0)
+    freeze_priority_score: float = Field(default=0.0, ge=0.0, le=100.0)
     disclaimer: str = RISK_DISCLAIMER
 
 
@@ -534,6 +547,9 @@ class DossierRiskSummary(BaseModel):
     risk_band: str
     top_archetype: str
     sub_scores: list[DossierSubScore] = Field(default_factory=list)
+    operational_role: str = "STANDARD_ACCOUNT"
+    retained_tainted_amount: float = Field(default=0.0, ge=0.0)
+    freeze_priority_score: float = Field(default=0.0, ge=0.0, le=100.0)
 
 
 class InvestigationDossier(BaseModel):

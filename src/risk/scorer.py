@@ -6,10 +6,13 @@
   (pass-through, smurfing, cycle participation, shared metadata, terminal
   cash-out, complaint relationship). No indicator is derived from `state`,
   `kyc_pincode` or `account_type`.
-* `anomaly_score` comes from `sklearn.ensemble.IsolationForest(random_state=42)`
-  fitted on the numeric behavioural features. It is min-max normalised over the
-  **uploaded dataset**, so it is dataset-relative: a different dataset shifts
-  the scores. The docs and the report say so explicitly.
+* `anomaly_score` is a multi-detector ensemble: an
+  `sklearn.ensemble.IsolationForest(random_state=42)` plus (on tiers that
+  enable it) a `LocalOutlierFactor` density check and an empirical robust-tail
+  quantile. Each detector is normalised over the **uploaded dataset** and
+  combined with fixed weights (forest-dominant), so it is dataset-relative: a
+  different dataset shifts the scores. The docs and the report say so
+  explicitly. TreeSHAP attributions continue to come from the IsolationForest.
 
 Explanations: up to three per account. Rule lines are *facts* (a measured
 value, the threshold it was compared against and the supporting UTRs); the
@@ -22,12 +25,14 @@ never legal evidence (`RISK_DISCLAIMER`).
 
 from __future__ import annotations
 
+import math
 from typing import Any, Final
 
 import numpy as np
 import polars as pl
 import shap
 from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
 
 from core.contracts import (
     ACCOUNT_FEATURE_SCHEMA,
@@ -39,7 +44,7 @@ from core.contracts import (
     RiskConfig,
     RiskExplanation,
 )
-from core.hardware import ComputeTier, HardwareProfile, detect_hardware_profile
+from core.hardware import HardwareProfile, detect_hardware_profile
 
 ARCHETYPE_LABELS: dict[str, str] = {
     "pass_through": "Rapid pass-through mule",
@@ -50,6 +55,25 @@ ARCHETYPE_LABELS: dict[str, str] = {
     "complaint": "Complaint-linked mule",
 }
 ARCHETYPE_NONE: str = "No domain indicator"
+
+OPERATIONAL_ROLES: Final[tuple[str, ...]] = (
+    "LAYER_1_COLLECTOR",
+    "LAYERING_CONDUIT",
+    "SMURF_DISTRIBUTOR",
+    "WASH_CYCLE_NODE",
+    "CASH_OUT_TERMINAL",
+    "COLLUSION_RING_MEMBER",
+    "STANDARD_ACCOUNT",
+)
+OPERATIONAL_ROLE_LABELS: Final[dict[str, str]] = {
+    "LAYER_1_COLLECTOR": "Layer-1 collector (victim-fund aggregator)",
+    "LAYERING_CONDUIT": "Layering conduit (rapid onward transfer)",
+    "SMURF_DISTRIBUTOR": "Smurf distributor (bulk-in, split-out)",
+    "WASH_CYCLE_NODE": "Wash-cycle node",
+    "CASH_OUT_TERMINAL": "Cash-out terminal",
+    "COLLUSION_RING_MEMBER": "Collusion-ring member",
+    "STANDARD_ACCOUNT": "No specialised operational role",
+}
 
 # Numeric behavioural features used by the anomaly model. Ground-truth labels
 # (`is_fraud`, `fraud_scheme`) and protected attributes (`account_type`,
@@ -123,6 +147,52 @@ def _ensure_columns(
         else:
             columns.append(pl.lit(None, dtype=dtype).alias(name))
     return frame.select(columns)
+
+
+def _normalise_anomaly(values: np.ndarray) -> np.ndarray:
+    """Min-max a detector's raw magnitude to 0..100 (all-zero if constant)."""
+    array = np.asarray(values, dtype=float)
+    if array.size == 0:
+        return array
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        return np.zeros(array.size, dtype=float)
+    lowest = float(finite.min())
+    highest = float(finite.max())
+    if highest - lowest <= 1e-12:
+        return np.zeros(array.size, dtype=float)
+    clipped = np.where(np.isfinite(array), array, lowest)
+    return np.clip((clipped - lowest) / (highest - lowest) * 100.0, 0.0, 100.0)
+
+
+def _empirical_tail(matrix: np.ndarray) -> np.ndarray:
+    """Empirical tail rank of each row's strongest robust feature deviation.
+
+    Each feature is standardised with the median and the median absolute
+    deviation (falling back to the standard deviation, then skipping constant
+    columns). The row's maximum absolute deviation is then replaced by its
+    empirical quantile among the uploaded accounts, so the detector reports
+    *how far into the tail* an account sits rather than an absolute distance.
+    """
+    rows = matrix.shape[0]
+    if rows < 2:
+        return np.zeros(rows, dtype=float)
+    median = np.median(matrix, axis=0)
+    mad = np.median(np.abs(matrix - median), axis=0) * 1.4826
+    std = np.std(matrix, axis=0)
+    variable = (mad > 1e-12) | (std > 1e-12)
+    if not variable.any():
+        return np.zeros(rows, dtype=float)
+    scale = np.where(mad > 1e-12, mad, np.where(std > 1e-12, std, 1.0))
+    deviation = np.abs((matrix - median) / scale)[:, variable].max(axis=1)
+    order = np.argsort(deviation, kind="stable")
+    ranks = np.empty(rows, dtype=float)
+    ranks[order] = np.arange(rows, dtype=float)
+    quantile = ranks / float(rows - 1)
+    # Only the extreme empirical tail counts. A row at the 85th percentile is
+    # not anomalous; the detector stays silent until the top 5% and scales to
+    # 1.0 at the most extreme observation.
+    return np.clip((quantile - 0.95) / 0.05, 0.0, 1.0)
 
 
 class RiskScorer:
@@ -211,8 +281,13 @@ class RiskScorer:
                 ).clip(upper_bound=1.0)
             )
         )
+        proximity = pl.col("network_proximity_risk").fill_null(0.0).clip(
+            lower_bound=0.0, upper_bound=1.0
+        )
         pass_through_score = (
-            pl.lit(0.6) * ratio_component + pl.lit(0.4) * speed_component
+            pl.lit(0.6) * ratio_component
+            + pl.lit(0.4) * speed_component
+            + pl.lit(0.15) * proximity * ratio_component
         ).clip(upper_bound=1.0)
 
         smurf_score = (
@@ -227,7 +302,7 @@ class RiskScorer:
         )
 
         cycle_score = (
-            pl.col("cycle_count").fill_null(0).cast(pl.Float64()) / 2.0
+            pl.col("cycle_count").fill_null(0).cast(pl.Float64()) / 1.25
         ).clip(upper_bound=1.0)
 
         shared_score = (
@@ -253,6 +328,18 @@ class RiskScorer:
             )
             .then(1.0)
             .otherwise(0.0)
+        )
+        # Graph proximity corroborates a complaint trail: a conduit the
+        # diffusion reaches strongly is treated as complaint-adjacent even when
+        # no NCRP row names it directly. A named account already scores 1.0.
+        # The signal is gated on the account actually moving money onward, so a
+        # passive background account merely touched by taint gets no credit.
+        complaint_score = pl.max_horizontal(
+            complaint_score,
+            proximity
+            * (pl.col("pass_through_ratio_15m").fill_null(0.0) >= 0.5).cast(
+                pl.Float64()
+            ),
         )
 
         frame = frame.with_columns(
@@ -340,6 +427,8 @@ class RiskScorer:
             }
             best = max(DOMAIN_KEYS, key=lambda key: (points[key], -DOMAIN_KEYS.index(key)))
             top = ARCHETYPE_LABELS[best] if points[best] > 0 else ARCHETYPE_NONE
+            role = self._operational_role(row)
+            retained = max(0.0, float(row.get("retained_tainted_amount") or 0.0))
             assessments.append(
                 RiskAssessment(
                     account_no=str(row["account_no"]),
@@ -350,6 +439,9 @@ class RiskScorer:
                     explanations=explanations,
                     domain_components=components,
                     top_archetype=top,
+                    operational_role=role,
+                    retained_tainted_amount=retained,
+                    freeze_priority_score=self._freeze_priority(row, role),
                 )
             )
 
@@ -361,6 +453,17 @@ class RiskScorer:
             pl.Series("top_reasons", reasons, dtype=pl.List(pl.String())),
             pl.Series("explanation_kinds", kinds, dtype=pl.List(pl.String())),
             pl.Series("evidence_txn_ids", evidence, dtype=pl.List(pl.String())),
+            pl.Series(
+                "operational_role", [a.operational_role for a in assessments]
+            ),
+            pl.Series(
+                "retained_tainted_amount",
+                [a.retained_tainted_amount for a in assessments],
+            ),
+            pl.Series(
+                "freeze_priority_score",
+                [a.freeze_priority_score for a in assessments],
+            ),
         )
         report = report.select(
             [
@@ -407,13 +510,31 @@ class RiskScorer:
             random_state=42, n_estimators=self.profile.iforest_estimators
         )
         model.fit(matrix)
-        magnitude = -model.score_samples(matrix)
-        lowest = float(magnitude.min())
-        highest = float(magnitude.max())
-        if not np.isfinite(lowest) or not np.isfinite(highest) or highest <= lowest:
-            anomaly_scores = np.zeros(rows, dtype=float)
+        forest_scores = _normalise_anomaly(-model.score_samples(matrix))
+        if self.profile.enable_knn_density and rows > 2:
+            neighbours = min(20, rows - 1)
+            density = LocalOutlierFactor(
+                n_neighbors=neighbours, novelty=False
+            )
+            density.fit_predict(matrix)
+            density_scores = _normalise_anomaly(
+                -density.negative_outlier_factor_
+            )
+            tail_scores = _normalise_anomaly(_empirical_tail(matrix))
+            # Weighted ensemble: the forest stays the primary detector, the
+            # density and empirical-tail views corroborate it without letting
+            # a single relative-rank signal dominate the score.
+            anomaly_scores = (
+                0.70 * forest_scores
+                + 0.15 * density_scores
+                + 0.15 * tail_scores
+            )
         else:
-            anomaly_scores = (magnitude - lowest) / (highest - lowest) * 100.0
+            anomaly_scores = (
+                0.80 * forest_scores
+                + 0.20 * _normalise_anomaly(_empirical_tail(matrix))
+            )
+        anomaly_scores = np.clip(anomaly_scores, 0.0, 100.0)
 
         explainer = shap.TreeExplainer(model)
         values = explainer(matrix).values
@@ -610,9 +731,9 @@ class RiskScorer:
             threshold=None,
             points=0.0,
             detail=(
-                f"[INDICATOR] Isolation Forest anomaly score {anomaly_score:.0f}/100 "
+                f"[INDICATOR] Anomaly ensemble score {anomaly_score:.0f}/100 "
                 f"(dataset-relative; it shifts when the dataset changes); "
-                f"strongest attribution: {_FEATURE_TEXT.get(feature, feature)} "
+                f"strongest Isolation Forest attribution: {_FEATURE_TEXT.get(feature, feature)} "
                 f"({contribution:+.2f}) on the model's internal tree path-length "
                 f"scale - not points on the 0-100 anomaly score, and not a "
                 f"contribution to the final risk score"
@@ -629,9 +750,70 @@ class RiskScorer:
             return "MEDIUM"
         return "LOW"
 
+    # --- operational role / freeze priority -------------------------------
+
+    def _operational_role(self, row: dict[str, Any]) -> str:
+        """Deterministic role from the strongest topology and behaviour signal.
+
+        The order encodes investigative precedence: a terminal that also
+        passes money onward is still reported as a cash-out point, a wash-cycle
+        participant outranks a generic conduit, and so on. Nothing here uses a
+        ground-truth label.
+        """
+        terminal = float(row.get("_terminal") or 0.0)
+        cycle_count = int(row.get("cycle_count") or 0)
+        smurf = float(row.get("_smurfing") or 0.0)
+        pass_through = float(row.get("_pass_through") or 0.0)
+        proximity = float(row.get("network_proximity_risk") or 0.0)
+        trail_hops = int(row.get("trail_hops_max") or 0)
+        shared_peers = max(
+            int(row.get("shared_device_account_count") or 0),
+            int(row.get("branch_cohort_48h_count") or 0),
+        )
+        direct = int(row.get("direct_complaint_count") or 0)
+        senders = int(row.get("unique_senders") or 0)
+        inflow = float(row.get("inflow_total") or 0.0)
+        outflow = float(row.get("outflow_total") or 0.0)
+
+        if terminal >= 0.5:
+            return "CASH_OUT_TERMINAL"
+        if cycle_count >= 1:
+            return "WASH_CYCLE_NODE"
+        if smurf >= 0.5:
+            return "SMURF_DISTRIBUTOR"
+        if pass_through >= 0.6 or (
+            proximity >= 0.5 and trail_hops >= 1 and pass_through >= 0.3
+        ):
+            return "LAYERING_CONDUIT"
+        if shared_peers >= 2:
+            return "COLLUSION_RING_MEMBER"
+        if direct >= 1 or (senders >= 10 and inflow > outflow):
+            return "LAYER_1_COLLECTOR"
+        return "STANDARD_ACCOUNT"
+
+    def _freeze_priority(self, row: dict[str, Any], role: str) -> float:
+        """0-100 triage index: risk, recoverable taint and graph proximity.
+
+        The index deliberately weights *recoverable* money (the FIFO residual
+        held at the account) so an investigator freezes the account where the
+        disputed funds still sit before an equally risky empty conduit.
+        """
+        risk = min(100.0, max(0.0, float(row.get("_risk_score") or 0.0)))
+        retained = max(0.0, float(row.get("retained_tainted_amount") or 0.0))
+        proximity = min(
+            1.0, max(0.0, float(row.get("network_proximity_risk") or 0.0))
+        )
+        taint_component = min(100.0, 25.0 * math.log10(1.0 + retained / 1_000.0))
+        score = 0.60 * risk + 0.30 * taint_component + 0.10 * proximity * 100.0
+        if role in ("CASH_OUT_TERMINAL", "WASH_CYCLE_NODE"):
+            score = min(100.0, score + 2.0)
+        return round(min(100.0, max(0.0, score)), 4)
+
 
 __all__ = [
     "ANOMALY_FEATURE_COLUMNS",
+    "OPERATIONAL_ROLES",
+    "OPERATIONAL_ROLE_LABELS",
     "RISK_DISCLAIMER",
     "RiskScorer",
 ]

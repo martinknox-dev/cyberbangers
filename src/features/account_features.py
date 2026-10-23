@@ -22,6 +22,7 @@ import duckdb
 import polars as pl
 
 from core.contracts import ACCOUNT_FEATURE_SCHEMA, FeatureConfig
+from core.hardware import detect_hardware_profile
 
 _EMPTY_FRAME: Final[pl.DataFrame] = pl.DataFrame(schema=ACCOUNT_FEATURE_SCHEMA)
 
@@ -340,6 +341,7 @@ def _prepare_accounts(accounts: pl.DataFrame | None) -> pl.DataFrame:
             "branch_code": pl.String(),
             "imei": pl.String(),
             "account_opening_date": pl.Date(),
+            "account_type": pl.String(),
         },
     )
     if prepared.height:
@@ -417,6 +419,11 @@ def extract_account_features(
 
     connection = duckdb.connect()
     try:
+        profile = detect_hardware_profile(cfg.compute_tier)
+        connection.execute(f"SET threads = {profile.duckdb_threads}")
+        connection.execute(
+            f"SET memory_limit = '{profile.duckdb_memory_limit}'"
+        )
         connection.register("tx", tx.to_arrow())
         connection.register("acc", acc.to_arrow())
         connection.register("cx", cx.to_arrow())
@@ -588,6 +595,36 @@ def extract_account_features(
     frame = frame.with_columns(
         pl.from_epoch(pl.col("_first_dt"), time_unit="s").alias("first_txn_timestamp"),
         pl.from_epoch(pl.col("last_ts").cast(pl.Int64()), time_unit="s").alias("last_txn_timestamp"),
+    )
+
+    # Cohort-normalised volume: compare each account with peers of the same
+    # account type (PMJDY / SAVINGS / CURRENT, or UNKNOWN when metadata is
+    # absent). A cohort without a usable spread (fewer than two accounts, or
+    # all volumes equal) contributes z = 0, never an invented outlier.
+    frame = frame.join(
+        acc.select("account_no", "account_type"), on="account_no", how="left"
+    ).with_columns(
+        (pl.col("inflow_total") + pl.col("outflow_total"))
+        .cast(pl.Float64())
+        .alias("_volume"),
+        pl.col("account_type").fill_null("UNKNOWN").alias("_cohort"),
+    )
+    cohort_stats = frame.group_by("_cohort").agg(
+        pl.col("_volume").mean().alias("_cohort_mean"),
+        pl.col("_volume").std(ddof=0).alias("_cohort_std"),
+        pl.len().alias("_cohort_size"),
+    )
+    frame = frame.join(cohort_stats, on="_cohort", how="left").with_columns(
+        pl.when(
+            (pl.col("_cohort_size") >= 2) & (pl.col("_cohort_std") > 0.0)
+        )
+        .then(
+            (pl.col("_volume") - pl.col("_cohort_mean")) / pl.col("_cohort_std")
+        )
+        .otherwise(0.0)
+        .cast(pl.Float64())
+        .round(6)
+        .alias("cohort_volume_zscore")
     )
 
     return frame.select(

@@ -428,6 +428,9 @@ class InvestigationDossierGenerator:
             risk_band=risk.risk_band,
             top_archetype=risk.top_archetype,
             sub_scores=sub_scores,
+            operational_role=risk.operational_role,
+            retained_tainted_amount=risk.retained_tainted_amount,
+            freeze_priority_score=risk.freeze_priority_score,
         )
 
     # --- Section C --------------------------------------------------------
@@ -536,6 +539,11 @@ class InvestigationDossierGenerator:
                     f"anomaly {summary.anomaly_score:.2f} · "
                     f"archetype: {_md_text(summary.top_archetype)}"
                 ),
+                (
+                    f"**Operational role:** {_md_text(summary.operational_role)} · "
+                    f"retained tainted funds {format_inr(summary.retained_tainted_amount)} · "
+                    f"freeze priority {summary.freeze_priority_score:.1f}/100"
+                ),
                 "",
                 "| Sub-score | Value | Weight | Points |",
                 "| :--- | ---: | ---: | ---: |",
@@ -610,6 +618,12 @@ class InvestigationDossierGenerator:
                 f"({_html_text(summary.risk_band)}) · domain "
                 f"{summary.domain_score:.2f} · anomaly {summary.anomaly_score:.2f} · "
                 f"archetype: {_html_text(summary.top_archetype)}</p>"
+            )
+            parts.append(
+                f"<p><strong>Operational role:</strong> "
+                f"{_html_text(summary.operational_role)} · retained tainted funds "
+                f"{_html_text(format_inr(summary.retained_tainted_amount))} · "
+                f"freeze priority {summary.freeze_priority_score:.1f}/100</p>"
             )
             parts.append(_html_table(
                 ["Sub-score", "Value", "Weight", "Points"],

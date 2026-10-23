@@ -34,6 +34,7 @@ from core.contracts import (
     MoneyTrailLeg,
     WashCycle,
 )
+from core.hardware import HardwareProfile, detect_hardware_profile
 
 _TERMINAL_MODES: Final[tuple[str, ...]] = ("AEPS", "ATM", "CASH")
 
@@ -137,6 +138,7 @@ class GraphAnalyzer:
         self._complaints = self._prepare_complaints(complaints)
         self._graph = self._build_multigraph()
         self._collapsed = self._build_collapsed_graph()
+        self._profile = detect_hardware_profile(self._config.compute_tier)
         self._outgoing: dict[str, list[_Edge]] = {}
         for edge in self._edges:
             self._outgoing.setdefault(edge.sender, []).append(edge)
@@ -271,6 +273,11 @@ class GraphAnalyzer:
         return collapsed
 
     # --- public API -------------------------------------------------------
+
+    @property
+    def profile(self) -> HardwareProfile:
+        """Resolved hardware-compute budget for the configured tier."""
+        return self._profile
 
     def build_multigraph(self) -> nx.MultiDiGraph:
         """The transaction multigraph (one edge per transaction)."""
@@ -480,6 +487,11 @@ class GraphAnalyzer:
             legs=legs,
             reached_accounts=reached,
             account_taint=account_taint,
+            retained_taint={
+                account: round(sum(lot.amount for lot in held), 2)
+                for account, held in lots.items()
+                if sum(lot.amount for lot in held) > MONEY_EPSILON
+            },
             total_taint=min(first_hop_taint, amount),
         )
 
@@ -607,7 +619,9 @@ class GraphAnalyzer:
         commission-style wash is separated from ordinary circular payments.
         """
         window = timedelta(hours=self._config.cycle_window_hours)
-        max_length = self._config.cycle_max_length
+        max_length = min(
+            self._config.cycle_max_length, self._profile.max_cycle_length
+        )
         max_decay = self._config.cycle_max_decay
         found: dict[tuple[str, ...], WashCycle] = {}
 
@@ -803,6 +817,9 @@ class GraphAnalyzer:
         complaint_links: dict[str, int] = {node: 0 for node in nodes}
         complaint_acks: dict[str, list[str]] = {node: [] for node in nodes}
         taint_max: dict[str, float] = {node: 0.0 for node in nodes}
+        retained_taint: dict[str, float] = {node: 0.0 for node in nodes}
+        proximity_seed: dict[str, float] = {node: 0.0 for node in nodes}
+        seen_utrs: set[str] = set()
         hops_max: dict[str, int] = {node: 0 for node in nodes}
         terminal_chains: dict[str, int] = {node: 0 for node in nodes}
         for link in self.correlate_complaints():
@@ -820,12 +837,26 @@ class GraphAnalyzer:
                     complaint_links[account] = complaint_links.get(account, 0) + 1
                     if ack_no:
                         complaint_acks[account].append(ack_no)
+                    # A complaint names the accounts at the edge of the fraud.
+                    proximity_seed[account] = 1.0
             utr = row.get("disputed_utr")
-            if not utr:
+            if not utr or str(utr) in seen_utrs:
                 continue
+            seen_utrs.add(str(utr))
             trail = self.trace_money_trail(utr, max_hops=3)
             for account, taint in trail.account_taint.items():
                 taint_max[account] = max(taint_max.get(account, 0.0), taint)
+                if taint > 0.0:
+                    proximity_seed[account] = max(
+                        proximity_seed.get(account, 0.0), 0.55
+                    )
+            for account, residual in trail.retained_taint.items():
+                # Distinct disputed UTRs are distinct tainted inflows, so the
+                # recoverable amount an account still holds is their sum. A
+                # repeated UTR is skipped above to avoid double counting.
+                retained_taint[account] = (
+                    retained_taint.get(account, 0.0) + residual
+                )
             for leg in trail.legs:
                 hops_max[leg.receiver_account] = max(
                     hops_max.get(leg.receiver_account, 0), leg.hop
@@ -834,6 +865,8 @@ class GraphAnalyzer:
                     terminal_chains[leg.receiver_account] = (
                         terminal_chains.get(leg.receiver_account, 0) + 1
                     )
+
+        proximity = self._network_proximity(proximity_seed)
 
         frame = pl.DataFrame(
             {
@@ -859,6 +892,12 @@ class GraphAnalyzer:
                 "terminal_chain_count": [
                     terminal_chains.get(node, 0) for node in nodes
                 ],
+                "retained_tainted_amount": [
+                    retained_taint.get(node, 0.0) for node in nodes
+                ],
+                "network_proximity_risk": [
+                    proximity.get(node, 0.0) for node in nodes
+                ],
             }
         )
         return frame.select(
@@ -867,6 +906,36 @@ class GraphAnalyzer:
                 for name, dtype in GRAPH_INDICATOR_SCHEMA.items()
             ]
         ).sort("account_no")
+
+    def _network_proximity(
+        self, seeds: Mapping[str, float]
+    ) -> dict[str, float]:
+        """Damped diffusion of complaint/taint proximity over the graph.
+
+        `seeds` marks accounts the evidence already touches (1.0 for accounts a
+        complaint names, 0.55 for downstream accounts that received tainted
+        funds). Each iteration propagates the best incoming score through the
+        directed graph with a fixed damping factor, so a conduit one hop from a
+        complaint outranks a merely adjacent background account. The result is
+        bounded to 0..1 and is deterministic for a fixed graph.
+        """
+        damping = 0.7
+        scores = dict(seeds)
+        for _ in range(self._profile.diffusion_iterations):
+            updates: dict[str, float] = {}
+            for sender, receiver in self._collapsed.edges():
+                incoming = scores.get(sender, 0.0) * damping
+                if incoming > updates.get(receiver, 0.0):
+                    updates[receiver] = incoming
+            if not updates:
+                break
+            for account, value in updates.items():
+                if value > scores.get(account, 0.0):
+                    scores[account] = value
+        return {
+            account: round(min(1.0, max(0.0, value)), 6)
+            for account, value in scores.items()
+        }
 
     def _pagerank(self) -> dict[str, float]:
         if self._collapsed.number_of_nodes() == 0:
@@ -882,7 +951,11 @@ class GraphAnalyzer:
         nodes = self._collapsed.number_of_nodes()
         edges = self._collapsed.number_of_edges()
         k = self._config.betweenness_k
-        if k is None and (
+        if k is None:
+            k = self._profile.betweenness_sample_k
+        if k is not None:
+            k = min(k, nodes)
+        elif (
             nodes > _BETWEENNESS_EXACT_NODE_LIMIT
             or nodes * edges > _BETWEENNESS_EXACT_WORK_BUDGET
         ):

@@ -386,6 +386,7 @@ class TestSimulatorTopologyFeatures:
         assert list(RISK_REPORT_SCHEMA) == [
             "account_no", "risk_score", "domain_score", "anomaly_score",
             "risk_band", "top_reasons", "explanation_kinds", "evidence_txn_ids",
+            "operational_role", "retained_tainted_amount", "freeze_priority_score",
         ]
 
 

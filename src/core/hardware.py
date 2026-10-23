@@ -84,11 +84,14 @@ def _fallback_system_memory_gb() -> float:
                     ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
                 ]
 
+            windll = getattr(ctypes, "windll", None)
+            if windll is None:
+                return 8.0
             status = _MemoryStatusEx()
             status.dwLength = ctypes.sizeof(_MemoryStatusEx)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            if windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
                 return round(float(status.ullTotalPhys) / (1024.0 * 1024.0), 2)
-        except Exception:
+        except (OSError, AttributeError, ValueError):
             return 8.0
     return 8.0
 

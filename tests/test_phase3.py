@@ -946,6 +946,11 @@ def test_prahar_verify_runs_cleanly_and_reports_the_seeded_benchmark() -> None:
     assert "seed=42" in report
     assert "Ingestion" in report and "rejected=" in report
     assert "HIGH" in report and "CRITICAL" in report
+    assert "compute_tier=" in report and "auto-detected=" in report
+    assert "HIGH+CRIT" in report
+    assert "combined involved precision=" in report
+    assert "Top 5 accounts by freeze priority" in report
+    assert "Recoverable taint" in report
     for scheme in (
         "rapid_pass_through", "fan_out_smurfing", "aeps_terminal_cash_out",
         "branch_collusion", "circular_wash",
