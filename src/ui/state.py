@@ -770,6 +770,18 @@ def build_correlation_view(bundle: PipelineBundle) -> CorrelationView:
     return CorrelationView(rows=tuple(rows), hotspots=tuple(hotspots))
 
 
+def dossier_markdown(dossier: InvestigationDossier) -> str:
+    return InvestigationDossierGenerator([]).render_markdown(dossier)
+
+
+def dossier_html(dossier: InvestigationDossier) -> bytes:
+    return InvestigationDossierGenerator([]).render_html(dossier)
+
+
+def dossier_json(dossier: InvestigationDossier) -> bytes:
+    return InvestigationDossierGenerator([]).render_json(dossier)
+
+
 __all__ = [
     "AccountDetailView",
     "CollusionGroup",
@@ -804,5 +816,8 @@ __all__ = [
     "build_leaderboard",
     "build_terminal_view",
     "build_trail_graph",
+    "dossier_html",
+    "dossier_json",
+    "dossier_markdown",
     "run_pipeline",
 ]

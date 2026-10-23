@@ -61,3 +61,11 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "shap.*"
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "plotly.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "st_link_analysis.*"
+ignore_missing_imports = true

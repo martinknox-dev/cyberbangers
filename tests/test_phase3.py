@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import polars as pl
 
@@ -30,6 +31,7 @@ from export.dossier import (
 from ingestion.mapper import DatasetIngester
 from risk.scorer import RiskScorer
 from simulator.generator import SyndicateDataSimulator
+from ui import state
 from ui.state import (
     build_account_detail,
     build_account_dossier,
@@ -46,6 +48,7 @@ from ui.state import (
 )
 
 BASE = datetime(2024, 6, 1, 10, 0)
+APP_PATH = Path(__file__).resolve().parents[1] / "src" / "ui" / "app.py"
 
 
 def _feature_row(account_no: str, **overrides: object) -> dict[str, object]:
@@ -610,3 +613,70 @@ def test_correlation_view_flags_interstate_links() -> None:
         sorted(view.hotspots, key=lambda item: (-len(item.ack_nos), item.key))
     )
     assert view.rows == tuple(sorted(view.rows, key=lambda item: (item.ack_a, item.ack_b)))
+
+
+def test_dossier_format_wrappers_delegate() -> None:
+    dossier = _generator().build()
+    assert state.dossier_markdown(dossier) == _generator().render_markdown(dossier)
+    assert state.dossier_html(dossier) == _generator().render_html(dossier)
+    assert state.dossier_json(dossier) == _generator().render_json(dossier)
+
+
+def test_app_renders_empty_state_without_a_dataset() -> None:
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_file(str(APP_PATH), default_timeout=120).run()
+    assert not app.exception, [str(item) for item in app.exception]
+    titles = [title.value for title in app.title]
+    assert any("PraharGraph" in title for title in titles)
+    labels = [tab.label for tab in app.tabs]
+    assert labels == [
+        "1 · Ingestion & Data Hygiene",
+        "2 · Mule Risk Ranking & XAI",
+        "3 · Money Trail & Syndicates",
+        "4 · Complaint Correlation & Dossier",
+    ]
+
+
+def test_offline_config_disables_telemetry_and_remote_fonts() -> None:
+    text = Path(".streamlit/config.toml").read_text()
+    assert "gatherUsageStats = false" in text
+    assert 'font = "sans serif"' in text
+
+
+def test_app_benchmark_load_populates_ingestion_metrics() -> None:
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_file(str(APP_PATH), default_timeout=300)
+    app.run()
+    assert not app.exception, [str(item) for item in app.exception]
+    app.button(key="load_benchmark").click().run()
+    assert not app.exception, [str(item) for item in app.exception]
+
+    metrics = {
+        item.label: int(str(item.value).replace(",", ""))
+        for item in app.metric
+    }
+    # the seeded benchmark is ingested, so Tab 1 shows real numbers
+    assert metrics["Rows total"] > 0
+    assert metrics["Accepted"] > 0
+    assert metrics["Rejected"] >= 3
+    assert metrics["Rows total"] == metrics["Accepted"] + metrics["Rejected"]
+
+
+def test_benchmark_load_returns_ingestion_reports() -> None:
+    from ui.app import load_benchmark
+
+    transactions, accounts, complaints, reports = load_benchmark()
+    assert transactions.height > 0 and accounts.height > 0 and complaints.height > 0
+    assert set(reports) == {"transactions", "accounts", "complaints"}
+    txn_report = reports["transactions"]
+    assert txn_report.rows_rejected == 3
+    assert set(txn_report.failure_counts) == {
+        "unparseable_amount", "missing:txn_id", "duplicate_utr",
+    }
+    assert txn_report.rows_accepted == transactions.height
+    assert txn_report.rows_total == transactions.height + 3
+    assert "rejection_reason" in txn_report.rejected_rows.columns
+    assert reports["accounts"].rows_rejected == 0
+    assert reports["complaints"].rows_rejected == 0
