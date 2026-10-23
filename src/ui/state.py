@@ -22,6 +22,7 @@ from core.contracts import (
     DossierScope,
     FeatureConfig,
     GraphConfig,
+    HardwareProfile,
     IngestionReport,
     InvestigationDossier,
     MoneyTrail,
@@ -29,6 +30,7 @@ from core.contracts import (
     RiskConfig,
     WashCycle,
 )
+from core.hardware import ComputeTier, detect_hardware_profile
 from export.dossier import (
     DossierAccount,
     DossierConfig,
@@ -53,6 +55,7 @@ class PipelineBundle:
     complaint_links: tuple[ComplaintLink, ...]
     reports: Mapping[str, IngestionReport]
     risk_config: RiskConfig
+    hardware_profile: HardwareProfile | None = None
 
 
 def run_pipeline(
@@ -64,11 +67,19 @@ def run_pipeline(
     graph_config: GraphConfig | None = None,
     risk_config: RiskConfig | None = None,
     reports: Mapping[str, IngestionReport] | None = None,
+    compute_tier: ComputeTier | None = None,
 ) -> PipelineBundle:
-    features = extract_account_features(transactions, accounts, complaints, feature_config)
-    analyzer = GraphAnalyzer(transactions, accounts, complaints, graph_config)
+    resolved_tier = compute_tier
+    features = extract_account_features(
+        transactions, accounts, complaints, feature_config
+    )
+    analyzer = GraphAnalyzer(
+        transactions, accounts, complaints, graph_config
+    )
     graph = analyzer.topology_metrics()
     resolved_risk = risk_config or RiskConfig()
+    if resolved_tier is not None:
+        resolved_risk = resolved_risk.model_copy(update={"compute_tier": resolved_tier})
     scorer = RiskScorer(resolved_risk)
     risk, assessments = scorer.score_with_assessments(features, graph)
     return PipelineBundle(
@@ -90,6 +101,7 @@ def run_pipeline(
         complaint_links=tuple(analyzer.correlate_complaints()),
         reports=dict(reports or {}),
         risk_config=resolved_risk,
+        hardware_profile=detect_hardware_profile(resolved_tier),
     )
 
 

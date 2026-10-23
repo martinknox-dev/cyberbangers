@@ -15,6 +15,8 @@ from typing import Literal
 import polars as pl
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from core.hardware import ComputeTier, HardwareProfile
+
 PaymentMode = Literal["UPI", "IMPS", "NEFT", "RTGS", "AEPS", "ATM", "CASH"]
 AccountType = Literal["SAVINGS", "PMJDY", "CURRENT"]
 TableKind = Literal["transactions", "complaints", "accounts"]
@@ -219,6 +221,7 @@ MONEY_EPSILON: float = 1e-6
 class FeatureConfig(BaseModel):
     """Configurable thresholds for the behavioural feature extractor."""
 
+    compute_tier: ComputeTier = "LITE"
     pass_through_window_minutes: int = Field(default=15, ge=1, le=1440)
     fan_out_window_minutes: int = Field(default=60, ge=1, le=1440)
     dormancy_threshold_days: int = Field(default=180, ge=0)
@@ -236,6 +239,7 @@ class FeatureConfig(BaseModel):
 class GraphConfig(BaseModel):
     """Configurable limits for graph tracing, cycle detection and correlation."""
 
+    compute_tier: ComputeTier = "LITE"
     max_hops: int = Field(default=3, ge=1, le=6)
     cycle_max_length: int = Field(default=5, ge=3, le=5)
     cycle_window_hours: int = Field(default=24, ge=1)
@@ -254,6 +258,7 @@ class GraphConfig(BaseModel):
 class RiskConfig(BaseModel):
     """Configurable weights and thresholds for the hybrid risk engine."""
 
+    compute_tier: ComputeTier = "LITE"
     domain_weight: float = Field(default=0.70, ge=0.0, le=1.0)
     anomaly_weight: float = Field(default=0.30, ge=0.0, le=1.0)
     pass_through_threshold: float = Field(default=0.85, ge=0.0, le=1.0)

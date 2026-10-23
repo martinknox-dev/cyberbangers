@@ -39,6 +39,7 @@ from core.contracts import (
     RiskConfig,
     RiskExplanation,
 )
+from core.hardware import ComputeTier, HardwareProfile, detect_hardware_profile
 
 ARCHETYPE_LABELS: dict[str, str] = {
     "pass_through": "Rapid pass-through mule",
@@ -129,6 +130,11 @@ class RiskScorer:
 
     def __init__(self, config: RiskConfig | None = None) -> None:
         self._config = config or RiskConfig()
+
+    @property
+    def profile(self) -> HardwareProfile:
+        """Resolved hardware-compute budget for the configured tier."""
+        return detect_hardware_profile(self._config.compute_tier)
 
     # --- public API -------------------------------------------------------
 
@@ -397,7 +403,9 @@ class RiskScorer:
             column[~np.isfinite(column)] = fill
             matrix[:, column_index] = column
 
-        model = IsolationForest(random_state=42, n_estimators=100)
+        model = IsolationForest(
+            random_state=42, n_estimators=self.profile.iforest_estimators
+        )
         model.fit(matrix)
         magnitude = -model.score_samples(matrix)
         lowest = float(magnitude.min())
