@@ -680,3 +680,60 @@ def test_benchmark_load_returns_ingestion_reports() -> None:
     assert "rejection_reason" in txn_report.rejected_rows.columns
     assert reports["accounts"].rows_rejected == 0
     assert reports["complaints"].rows_rejected == 0
+
+
+def test_markdown_escapes_backslashes_so_pipes_cannot_split_cells() -> None:
+    account = DossierAccount(
+        account_no="A\\|B",
+        metadata=_account_row("A\\|B", branch_code="BR\\|042"),
+        transactions=(_txn("U1", "VICTIM", "A\\|B", 10.0, 0),),
+    )
+    markdown = InvestigationDossierGenerator([account]).render_markdown()
+    # three backslashes before the pipe: the pipe stays escaped even after the
+    # backslash itself is unescaped by the Markdown renderer
+    assert "A\\\\\\|B" in markdown
+    assert "BR\\\\\\|042" in markdown
+
+
+def test_markdown_escapes_values_outside_tables() -> None:
+    account = DossierAccount(
+        account_no="<b>A</b>",
+        metadata=_account_row("<b>A</b>"),
+        transactions=(_txn("U<1>", "VICTIM", "<b>A</b>", 10.0, 0),),
+    )
+    generator = InvestigationDossierGenerator(
+        [account], DossierConfig(case_reference="PG-<script>x</script>")
+    )
+    markdown = generator.render_markdown()
+    assert "<script>" not in markdown
+    assert "&lt;script&gt;" in markdown
+    assert "<b>A</b>" not in markdown
+    assert "U&lt;1&gt;" in markdown
+
+
+def test_trail_graph_routes_complaint_acks_by_membership_not_prefix() -> None:
+    transactions, accounts, complaints = _pipeline_frames()
+    renamed = complaints.with_columns(pl.col("ack_no").str.replace("ACK", "NCRP-"))
+    bundle = run_pipeline(transactions, accounts, renamed)
+    view = build_trail_graph(bundle, start="NCRP-1", max_hops=2)
+    # an ACK that does not start with "ACK" must still use the complaint tracer
+    assert any(edge.txn_id == "T1" for edge in view.edges)
+
+
+def test_app_selection_lists_are_disclosed_and_manual_entry_works() -> None:
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_file(str(APP_PATH), default_timeout=300)
+    app.run()
+    app.button(key="load_benchmark").click().run()
+    assert not app.exception, [str(item) for item in app.exception]
+
+    captions = " ".join(str(item.value) for item in app.caption)
+    assert "top 200" in captions          # accounts
+    assert "first 500" in captions        # transaction references
+
+    assert app.text_input(key="trail_manual")
+    app.text_input(key="trail_manual").set_value("NO-SUCH-ID").run()
+    assert not app.exception, [str(item) for item in app.exception]
+    warnings = " ".join(str(item.value) for item in app.warning)
+    assert "No trail found" in warnings

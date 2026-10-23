@@ -263,31 +263,45 @@ def _render_graph(bundle: state.PipelineBundle | None) -> None:
     if bundle is None:
         return
     source = st.radio("Trace from", ["Account", "UTR", "Complaint ACK"], horizontal=True)
+    accounts = [row.account_no for row in state.build_leaderboard(bundle).rows]
+    utrs = sorted(set(bundle.transactions["txn_id"].to_list()))
+    ack_nos = sorted(set(bundle.complaints["ack_no"].to_list()))
+    st.caption(
+        "Selection lists are capped for responsiveness: top 200 of "
+        f"{len(accounts)} accounts, first 500 of {len(utrs)} transaction "
+        f"references, all {len(ack_nos)} complaint ACKs. Enter any reference below."
+    )
     options = {
-        "Account": [row.account_no for row in state.build_leaderboard(bundle).rows[:200]],
-        "UTR": sorted(set(bundle.transactions["txn_id"].to_list()))[:500],
-        "Complaint ACK": sorted(set(bundle.complaints["ack_no"].to_list())),
+        "Account": accounts[:200],
+        "UTR": utrs[:500],
+        "Complaint ACK": ack_nos,
     }[source]
-    entity = st.selectbox("Reference", options) if options else ""
+    manual = st.text_input(
+        "Or enter an account number, UTR or complaint ACK", key="trail_manual"
+    )
+    entity = manual.strip() or (st.selectbox("Reference", options) if options else "")
     hops = st.slider("Hops", 1, 6, 3)
     if entity:
         view = state.build_trail_graph(bundle, start=entity, max_hops=hops)
         st.caption(f"Trail origin: {view.origin_label}")
-        st_link_analysis(
-            elements=view.elements,
-            layout={"name": "cose", "animate": False, "fit": True},
-            node_styles=[
-                NodeStyle(label="account", color="#345eeb", caption="caption"),
-                NodeStyle(label="terminal", color="#b00020", caption="caption"),
-            ],
-            # one style per hop so multi-hop trails stay visually distinguishable
-            edge_styles=[
-                EdgeStyle(label=f"hop {hop}", directed=True, caption="caption")
-                for hop in range(1, 7)
-            ],
-            height=650,
-            key="trail_canvas",
-        )
+        if not view.nodes:
+            st.warning(f"No trail found for {entity} within {hops} hops.")
+        else:
+            st_link_analysis(
+                elements=view.elements,
+                layout={"name": "cose", "animate": False, "fit": True},
+                node_styles=[
+                    NodeStyle(label="account", color="#345eeb", caption="caption"),
+                    NodeStyle(label="terminal", color="#b00020", caption="caption"),
+                ],
+                # one style per hop so multi-hop trails stay distinguishable
+                edge_styles=[
+                    EdgeStyle(label=f"hop {hop}", directed=True, caption="caption")
+                    for hop in range(1, 7)
+                ],
+                height=650,
+                key="trail_canvas",
+            )
     loops, collusion, terminals = st.tabs(
         ["Circular wash loops", "Branch / IMEI cohorts", "AePS terminal hotspots"]
     )
@@ -341,18 +355,26 @@ def _render_case(bundle: state.PipelineBundle | None) -> None:
     )
     dossier = None
     if scope == "Account":
-        account_nos = [
-            row.account_no for row in state.build_leaderboard(bundle).rows[:200]
-        ]
-        if account_nos:
-            dossier = state.build_account_dossier(
-                bundle, st.selectbox("Account", account_nos, key="dossier_account")
-            )
+        account_nos = [row.account_no for row in state.build_leaderboard(bundle).rows]
+        st.caption(
+            f"Showing top 200 of {len(account_nos)} accounts by risk score; "
+            "enter any account number below."
+        )
+        manual = st.text_input(
+            "Or enter an account number", key="dossier_account_manual"
+        )
+        chosen_account = manual.strip() or (
+            st.selectbox("Account", account_nos[:200], key="dossier_account")
+            if account_nos else ""
+        )
+        if chosen_account:
+            dossier = state.build_account_dossier(bundle, chosen_account)
     elif scope == "Cluster":
-        account_nos = [
-            row.account_no for row in state.build_leaderboard(bundle).rows[:20]
-        ]
-        chosen = st.multiselect("Cluster accounts", account_nos, key="dossier_cluster")
+        account_nos = [row.account_no for row in state.build_leaderboard(bundle).rows]
+        st.caption(f"Showing top 20 of {len(account_nos)} accounts by risk score.")
+        chosen = st.multiselect(
+            "Cluster accounts", account_nos[:20], key="dossier_cluster"
+        )
         if chosen:
             dossier = state.build_cluster_dossier(bundle, chosen)
     else:

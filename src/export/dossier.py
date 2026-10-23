@@ -101,8 +101,21 @@ def rejected_rows_csv(report: IngestionReport) -> bytes:
     return report.rejected_rows.write_csv().encode("utf-8")
 
 
-def _md_cell(value: object) -> str:
-    return str(value).replace("|", "\\|").replace("\n", " ")
+def _md_text(value: object) -> str:
+    """Escape one interpolated value so it cannot alter Markdown structure.
+
+    Backslashes are escaped before pipes: a value ending in a backslash must
+    not turn the following cell delimiter into an escaped (inert) pipe.
+    Angle brackets are entity-escaped so a Markdown viewer that allows raw
+    HTML cannot execute attacker-supplied markup.
+    """
+    text = (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\n", " ")
+    )
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _html_text(value: object) -> str:
@@ -472,18 +485,21 @@ class InvestigationDossierGenerator:
     def render_markdown(self, dossier: InvestigationDossier | None = None) -> str:
         data = dossier or self.build()
         lines = [
-            f"# Case Evidence Dossier — {data.case_reference}", "",
-            f"**Scope:** {data.scope}  ",
-            f"**Subject accounts:** {', '.join(data.subject_accounts) or 'none'}  ",
-            f"**Generated on:** {self._generated_on_text()}  ", "",
+            f"# Case Evidence Dossier — {_md_text(data.case_reference)}", "",
+            f"**Scope:** {_md_text(data.scope)}  ",
+            (
+                "**Subject accounts:** "
+                f"{_md_text(', '.join(data.subject_accounts) or 'none')}  "
+            ),
+            f"**Generated on:** {_md_text(self._generated_on_text())}  ", "",
             "## Section A — Verified Evidentiary Facts", "",
             "> Records exactly as supplied by the source systems. Not a certified copy.", "",
             "| Category | Record | Detail | Source |", "| :--- | :--- | :--- | :--- |",
         ]
         for fact in data.facts:
             lines.append(
-                f"| {_md_cell(fact.category)} | {_md_cell(fact.label)} | "
-                f"{_md_cell(fact.value)} | {_md_cell(fact.source)} |"
+                f"| {_md_text(fact.category)} | {_md_text(fact.label)} | "
+                f"{_md_text(fact.value)} | {_md_text(fact.source)} |"
             )
         lines += ["", "## Section B — Analytical & AI Risk Indicators", "",
                   "> Automated analysis. Investigative leads, not evidence.", ""]
@@ -492,35 +508,48 @@ class InvestigationDossierGenerator:
             lines += [
                 (
                     f"**Risk score:** {summary.risk_score:.2f}/100 "
-                    f"({summary.risk_band}) · domain {summary.domain_score:.2f} · "
+                    f"({_md_text(summary.risk_band)}) · "
+                    f"domain {summary.domain_score:.2f} · "
                     f"anomaly {summary.anomaly_score:.2f} · "
-                    f"archetype: {summary.top_archetype}"
+                    f"archetype: {_md_text(summary.top_archetype)}"
                 ),
                 "",
                 "| Sub-score | Value | Weight | Points |",
                 "| :--- | ---: | ---: | ---: |",
             ]
             for score in summary.sub_scores:
-                lines.append(f"| {_md_cell(score.label)} | {score.value:.1f} | "
+                lines.append(f"| {_md_text(score.label)} | {score.value:.1f} | "
                              f"{score.weight:.0f} | {score.points:.1f} |")
             lines.append("")
         lines += ["| Indicator | Method | Value | Explanation |",
                   "| :--- | :--- | ---: | :--- |"]
         for indicator in data.indicators:
-            lines.append(f"| {_md_cell(indicator.indicator)} | {_md_cell(indicator.method)} | "
-                         f"{indicator.value:.4f} | {_md_cell(indicator.explanation)} |")
+            lines.append(f"| {_md_text(indicator.indicator)} | {_md_text(indicator.method)} | "
+                         f"{indicator.value:.4f} | {_md_text(indicator.explanation)} |")
         lines += ["", "## Section C — Section 94 BNSS Requisition (Draft)", "",
-                  f"**{data.requisition.subject}**", "",
-                  f"To: {data.requisition.addressee}", ""]
-        lines += [f"{paragraph}" for paragraph in data.requisition.paragraphs]
+                  f"**{_md_text(data.requisition.subject)}**", "",
+                  f"To: {_md_text(data.requisition.addressee)}", ""]
+        lines += [
+            _md_text(paragraph) for paragraph in data.requisition.paragraphs
+        ]
         for group in data.requisition.bank_requests:
-            lines += ["", f"### {group.bank_name} (IFSC prefix {group.ifsc_prefix})", "",
-                      f"- Accounts: {', '.join(group.accounts) or 'none'}",
-                      f"- Transaction references: {', '.join(group.utrs) or 'none'}",
-                      "- Documents required:"]
-            lines += [f"  - {document}" for document in group.documents]
-        lines += ["", f"*{data.requisition.legal_note}*", "",
-                  f"**Disclaimer:** {data.disclaimer}", ""]
+            lines += [
+                "",
+                (
+                    f"### {_md_text(group.bank_name)} "
+                    f"(IFSC prefix {_md_text(group.ifsc_prefix)})"
+                ),
+                "",
+                f"- Accounts: {_md_text(', '.join(group.accounts) or 'none')}",
+                (
+                    "- Transaction references: "
+                    f"{_md_text(', '.join(group.utrs) or 'none')}"
+                ),
+                "- Documents required:",
+            ]
+            lines += [f"  - {_md_text(document)}" for document in group.documents]
+        lines += ["", f"*{_md_text(data.requisition.legal_note)}*", "",
+                  f"**Disclaimer:** {_md_text(data.disclaimer)}", ""]
         return "\n".join(lines)
 
     def render_html(self, dossier: InvestigationDossier | None = None) -> bytes:

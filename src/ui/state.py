@@ -494,7 +494,14 @@ def _node_lookup(bundle: PipelineBundle) -> dict[str, tuple[float, str, int]]:
 
 
 def _resolve_trail(bundle: PipelineBundle, start: str, max_hops: int) -> MoneyTrail:
-    if start.startswith("ACK"):
+    """Route by complaint membership, never by an id prefix.
+
+    Real NCRP acknowledgement numbers are not guaranteed to start with "ACK",
+    and an account id may. Membership in the complaint frame is the only
+    reliable signal that the reference names a complaint.
+    """
+    ack_nos = set(bundle.complaints["ack_no"].to_list())
+    if start in ack_nos:
         return bundle.analyzer.trace_complaint_trail(start, max_hops=max_hops)
     return bundle.analyzer.trace_money_trail(start, max_hops=max_hops)
 
