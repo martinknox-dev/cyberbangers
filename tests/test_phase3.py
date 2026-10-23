@@ -11,6 +11,9 @@ from core.contracts import (
     DOMAIN_KEYS,
     GRAPH_INDICATOR_SCHEMA,
     IngestionReport,
+    MoneyTrail,
+    MoneyTrailLeg,
+    RiskAssessment,
 )
 from export.dossier import (
     DossierAccount,
@@ -200,3 +203,82 @@ def test_format_inr_uses_indian_grouping() -> None:
     assert format_inr(1_000) == "₹1,000.00"
     assert format_inr(100_000) == "₹1,00,000.00"
     assert format_inr(12_345_678.9) == "₹1,23,45,678.90"
+
+
+def _scored_assessment(account_no: str = "MULE") -> RiskAssessment:
+    """A real assessment from a fitted model (the anomaly line needs >= 10 rows)."""
+    features = pl.DataFrame(
+        [_feature_row(account_no)]
+        + [
+            _feature_row(f"B{i:02d}", pass_through_ratio_15m=0.05,
+                         median_retention_minutes=600.0, smurf_bulk_inflow_count=0,
+                         smurf_split_count=0, dormancy_days_before_burst=2.0)
+            for i in range(11)
+        ],
+        schema=ACCOUNT_FEATURE_SCHEMA,
+    )
+    graph = pl.DataFrame(
+        [_graph_row(account_no)] + [_graph_row(f"B{i:02d}") for i in range(11)],
+        schema=GRAPH_INDICATOR_SCHEMA,
+    )
+    _, assessments = RiskScorer().score_with_assessments(features, graph)
+    return next(item for item in assessments if item.account_no == account_no)
+
+
+def test_section_b_separates_indicators_from_facts() -> None:
+    account = DossierAccount(
+        account_no="MULE",
+        metadata=_account_row("MULE"),
+        risk=_scored_assessment("MULE"),
+        feature_row=_feature_row("MULE"),
+        graph_row=_graph_row("MULE"),
+        transactions=(_txn("U1", "VICTIM", "MULE", 100.0, 0),),
+        trail=MoneyTrail(
+            origin_account="MULE", origin_amount=100.0, origin_txn_id="U1",
+            max_hops=3, total_taint=100.0, account_taint={"MULE2": 90.0},
+            legs=[MoneyTrailLeg(hop=1, txn_id="U2", sender_account="MULE",
+                                receiver_account="MULE2", amount=90.0,
+                                timestamp=BASE, payment_mode="UPI", taint_amount=90.0)],
+        ),
+    )
+    generator = InvestigationDossierGenerator([account])
+    dossier = generator.build()
+
+    methods = {indicator.method for indicator in dossier.indicators}
+    assert "DOMAIN_RULE" in methods and "FIFO_TAINT" in methods
+    assert "ISOLATION_FOREST_SHAP" in methods
+    assert all(indicator.explanation for indicator in dossier.indicators)
+    # nothing analytical leaks into the evidentiary section
+    fact_text = " ".join(f"{f.label} {f.value}" for f in dossier.facts).lower()
+    assert "shap" not in fact_text
+    assert "taint" not in fact_text
+    assert "risk" not in fact_text
+
+    assert dossier.risk_summary is not None
+    assert len(dossier.risk_summary.sub_scores) == 7          # 6 domains + anomaly
+    assert {score.domain for score in dossier.risk_summary.sub_scores} >= set(DOMAIN_KEYS)
+
+
+def test_fifo_taint_indicator_states_the_assumption() -> None:
+    account = DossierAccount(
+        account_no="MULE", metadata=_account_row("MULE"),
+        trail=MoneyTrail(
+            origin_account="MULE", origin_amount=100.0, origin_txn_id="U1",
+            max_hops=3, total_taint=90.0, account_taint={"MULE2": 90.0},
+            legs=[MoneyTrailLeg(hop=1, txn_id="U2", sender_account="MULE",
+                                receiver_account="MULE2", amount=90.0,
+                                timestamp=BASE, payment_mode="UPI", taint_amount=90.0)],
+        ),
+    )
+    dossier = InvestigationDossierGenerator([account]).build()
+    taint = next(i for i in dossier.indicators if i.method == "FIFO_TAINT")
+    assert taint.unit == "rupees"
+    assert taint.value == 90.0
+    assert "FIFO" in taint.explanation or "first-in-first-out" in taint.explanation
+    assert taint.txn_ids == ["U2"]
+
+
+def test_account_without_risk_still_produces_an_empty_section_b() -> None:
+    dossier = InvestigationDossierGenerator([DossierAccount(account_no="GHOST")]).build()
+    assert dossier.indicators == []
+    assert dossier.risk_summary is None

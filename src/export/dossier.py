@@ -11,17 +11,23 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from core.coerce import as_date, as_datetime, as_float, as_str
 from core.contracts import (
     BNSS_SECTION_94,
+    DOMAIN_KEYS,
+    DOMAIN_LABELS,
     DOSSIER_DISCLAIMER,
     REQUISITION_DOCUMENTS,
     DossierFact,
+    DossierIndicator,
     DossierRequisition,
+    DossierRiskSummary,
     DossierScope,
+    DossierSubScore,
     IngestionReport,
     InvestigationDossier,
     MoneyTrail,
@@ -43,6 +49,21 @@ DEFAULT_BANK_NAMES: dict[str, str] = {
 _FACT_ORDER: dict[str, int] = {
     "ACCOUNT": 0, "TRANSACTION": 1, "COMPLAINT": 2, "SHARED_KYC": 3,
 }
+
+IndicatorUnit = Literal["score", "ratio", "count", "rupees"]
+
+_INDICATOR_UNITS: dict[str, IndicatorUnit] = {
+    "pass_through": "ratio", "smurfing": "count", "cycle_participation": "count",
+    "shared_metadata": "count", "terminal_cashout": "count",
+    "complaint_relationship": "count", "isolation_forest_anomaly": "score",
+}
+_TOPOLOGY_FIELDS: tuple[tuple[str, str, IndicatorUnit], ...] = (
+    ("pagerank", "PageRank centrality", "score"),
+    ("betweenness_centrality", "Betweenness centrality (bridge role)", "score"),
+    ("cycle_count", "Closed money cycles involving this account", "count"),
+    ("terminal_chain_count", "Independent chains terminating here", "count"),
+    ("complaint_link_count", "NCRP cases linked through shared evidence", "count"),
+)
 
 
 def format_inr(amount: float) -> str:
@@ -260,6 +281,87 @@ class InvestigationDossierGenerator:
             ))
         return facts
 
+    # --- Section B --------------------------------------------------------
+    def _indicators_for(self, account: DossierAccount) -> list[DossierIndicator]:
+        indicators: list[DossierIndicator] = []
+        risk = account.risk
+        if risk is not None:
+            for item in risk.explanations:
+                indicators.append(DossierIndicator(
+                    indicator=item.indicator,
+                    method=("ISOLATION_FOREST_SHAP"
+                            if item.indicator == "isolation_forest_anomaly"
+                            else "DOMAIN_RULE"),
+                    value=item.measured_value if item.measured_value is not None else 0.0,
+                    unit=_INDICATOR_UNITS.get(item.indicator, "score"),
+                    threshold=item.threshold,
+                    points=item.points,
+                    explanation=item.detail,
+                    txn_ids=list(item.evidence_txn_ids),
+                ))
+        graph = account.graph_row or {}
+        for indicator, label, unit in _TOPOLOGY_FIELDS:
+            value = as_float(graph.get(indicator))
+            if value <= 0:
+                continue
+            indicators.append(DossierIndicator(
+                indicator=indicator, method="TOPOLOGY", value=value, unit=unit,
+                explanation=(f"Graph topology measurement: {label.lower()} = "
+                             f"{value:.4f}. Computed from the supplied ledger only."),
+            ))
+        trail = account.trail
+        if trail is not None and trail.legs:
+            indicators.append(DossierIndicator(
+                indicator="fifo_taint_reached", method="FIFO_TAINT",
+                value=trail.total_taint, unit="rupees",
+                explanation=(
+                    f"{format_inr(trail.total_taint)} of the "
+                    f"{format_inr(trail.origin_amount)} traced from "
+                    f"A/C {trail.origin_account} left it within {trail.max_hops} "
+                    "hops under the first-in-first-out tainted-balance "
+                    "assumption. Funds held by the account are not counted as "
+                    "having moved."),
+                txn_ids=[leg.txn_id for leg in trail.legs],
+            ))
+        return indicators
+
+    def _risk_summary(self) -> DossierRiskSummary | None:
+        candidates: list[tuple[DossierAccount, RiskAssessment]] = [
+            (account, account.risk)
+            for account in self._accounts
+            if account.risk is not None
+        ]
+        if not candidates:
+            return None
+        _, risk = min(
+            candidates, key=lambda pair: (-pair[1].risk_score, pair[0].account_no)
+        )
+        components = risk.domain_components
+        weights = self._config.domain_weights
+        sub_scores: list[DossierSubScore] = []
+        for key in DOMAIN_KEYS:
+            value = max(0.0, min(100.0, components.get(key, 0.0)))
+            weight = weights.get(key, 0.0)
+            sub_scores.append(DossierSubScore(
+                domain=key, label=DOMAIN_LABELS[key], value=value,
+                weight=weight, points=weight * value / 100.0,
+            ))
+        anomaly_weight = weights.get("anomaly", 0.0)
+        sub_scores.append(DossierSubScore(
+            domain="anomaly", label=DOMAIN_LABELS["anomaly"],
+            value=risk.anomaly_score, weight=anomaly_weight,
+            points=anomaly_weight * risk.anomaly_score / 100.0,
+        ))
+        return DossierRiskSummary(
+            account_no=risk.account_no,
+            risk_score=risk.risk_score,
+            domain_score=risk.domain_score,
+            anomaly_score=risk.anomaly_score,
+            risk_band=risk.risk_band,
+            top_archetype=risk.top_archetype,
+            sub_scores=sub_scores,
+        )
+
     # --- assembly ---------------------------------------------------------
     def build(self) -> InvestigationDossier:
         if self._built is not None:
@@ -278,7 +380,12 @@ class InvestigationDossierGenerator:
             scope=self._config.scope,
             subject_accounts=[account.account_no for account in self._accounts],
             facts=facts,
-            indicators=[],
+            indicators=[
+                indicator
+                for account in self._accounts
+                for indicator in self._indicators_for(account)
+            ],
+            risk_summary=self._risk_summary(),
             # Minimal valid requisition: Task 4 replaces this inline literal with
             # `requisition=self._requisition()` (bank-grouped, Section 94 BNSS).
             requisition=DossierRequisition(
