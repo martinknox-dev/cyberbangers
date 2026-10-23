@@ -157,6 +157,7 @@ class DossierAccount:
     imei_peers: Sequence[Mapping[str, object]] = ()
     branch_peers: Sequence[Mapping[str, object]] = ()
     ledger_txn_ids: frozenset[str] | None = None   # None = every leg
+    primary_ack_no: str | None = None              # complaint dossiers: subject ACK
 
 
 _DEFAULT_DOMAIN_WEIGHTS: dict[str, float] = {
@@ -175,6 +176,7 @@ class DossierConfig(BaseModel):
     scope: DossierScope = "ACCOUNT"
     generated_on: date | None = None
     max_ledger_rows: int = Field(default=200, ge=1)
+    max_kyc_peers: int = Field(default=25, ge=1)
     deadline_days: int = Field(default=7, ge=1)
     bank_names: dict[str, str] = Field(default_factory=lambda: dict(DEFAULT_BANK_NAMES))
     requested_documents: tuple[str, ...] = REQUISITION_DOCUMENTS
@@ -212,7 +214,9 @@ class InvestigationDossierGenerator:
             f"A/C {account.account_no} · IFSC {ifsc} · "
             f"branch {as_str(metadata.get('branch_code')) or 'not recorded'} · "
             f"{as_str(metadata.get('account_type')) or 'type not recorded'} · "
-            f"opened {opened.isoformat() if opened else 'not recorded'}"
+            f"opened {opened.isoformat() if opened else 'not recorded'} · "
+            f"mobile {as_str(metadata.get('mobile_no')) or 'not recorded'} · "
+            f"IMEI {as_str(metadata.get('imei')) or 'not recorded'}"
         )
         return DossierFact(category="ACCOUNT", label="Account record", value=value,
                            source="account_master", account_no=account.account_no)
@@ -260,15 +264,21 @@ class InvestigationDossierGenerator:
             account.complaints,
             key=lambda row: as_str(row.get("ack_no")),
         )
+        primary = account.primary_ack_no
         facts: list[DossierFact] = []
         for row in rows:
             ack_no = as_str(row.get("ack_no"))
             reported = as_datetime(row.get("reported_timestamp"))
             amount = as_float(row.get("disputed_amount"))
+            related = primary is not None and ack_no != primary
+            prefix = (
+                "Related corroborating NCRP complaint" if related
+                else "NCRP complaint"
+            )
             facts.append(DossierFact(
                 category="COMPLAINT",
                 label=(
-                    f"NCRP complaint {ack_no} "
+                    f"{prefix} {ack_no} "
                     f"({as_str(row.get('fraud_category')) or 'category not recorded'})"
                 ),
                 value=(
@@ -323,6 +333,19 @@ class InvestigationDossierGenerator:
                 ),
                 source="account_master",
                 account_no=account.account_no,
+            ))
+        limit = self._config.max_kyc_peers
+        if len(facts) > limit:
+            total = len(facts)
+            facts = facts[:limit]
+            facts.append(DossierFact(
+                category="SHARED_KYC", label="Shared-KYC listing truncated",
+                value=(
+                    f"Showing the first {limit} of {total} shared-KYC peer records "
+                    f"for A/C {account.account_no}; bulk branch openings are "
+                    "bounded here and remain available in the account master."
+                ),
+                source="generator", account_no=account.account_no,
             ))
         return facts
 
@@ -635,14 +658,34 @@ class InvestigationDossierGenerator:
         if self._built is not None:
             return self._built
         facts = [fact for account in self._accounts for fact in self._facts_for(account)]
-        facts.sort(key=lambda item: (
-            _FACT_ORDER[item.category],
-            item.account_no or "",
-            item.timestamp or datetime.min,
-            item.txn_id or "",
-            item.ack_no or "",
-            item.label,
-        ))
+        primary_ack = next(
+            (
+                account.primary_ack_no
+                for account in self._accounts
+                if account.primary_ack_no is not None
+            ),
+            None,
+        )
+
+        def _fact_key(item: DossierFact) -> tuple[object, ...]:
+            # On complaint dossiers the subject ACK is listed before every
+            # related/corroborating complaint, regardless of account or time.
+            secondary = int(
+                primary_ack is not None
+                and item.category == "COMPLAINT"
+                and item.ack_no != primary_ack
+            )
+            return (
+                _FACT_ORDER[item.category],
+                secondary,
+                item.account_no or "",
+                item.timestamp or datetime.min,
+                item.txn_id or "",
+                item.ack_no or "",
+                item.label,
+            )
+
+        facts.sort(key=_fact_key)
         dossier = InvestigationDossier(
             case_reference=self._config.case_reference,
             scope=self._config.scope,

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 import polars as pl
 
@@ -52,6 +52,7 @@ class PipelineBundle:
     wash_cycles: tuple[WashCycle, ...]
     complaint_links: tuple[ComplaintLink, ...]
     reports: Mapping[str, IngestionReport]
+    risk_config: RiskConfig
 
 
 def run_pipeline(
@@ -67,7 +68,8 @@ def run_pipeline(
     features = extract_account_features(transactions, accounts, complaints, feature_config)
     analyzer = GraphAnalyzer(transactions, accounts, complaints, graph_config)
     graph = analyzer.topology_metrics()
-    scorer = RiskScorer(risk_config)
+    resolved_risk = risk_config or RiskConfig()
+    scorer = RiskScorer(resolved_risk)
     risk, assessments = scorer.score_with_assessments(features, graph)
     return PipelineBundle(
         transactions=transactions,
@@ -87,6 +89,7 @@ def run_pipeline(
         wash_cycles=tuple(analyzer.detect_wash_cycles()),
         complaint_links=tuple(analyzer.correlate_complaints()),
         reports=dict(reports or {}),
+        risk_config=resolved_risk,
     )
 
 
@@ -283,6 +286,7 @@ def build_dossier_account(
     *,
     ledger_txn_ids: frozenset[str] | None = None,
     max_hops: int | None = None,
+    primary_ack_no: str | None = None,
 ) -> DossierAccount:
     master = _row_for(bundle.accounts, account_no)
     assessment = next(
@@ -307,11 +311,31 @@ def build_dossier_account(
         imei_peers=_imei_peers(bundle.accounts, master),
         branch_peers=_branch_peers(bundle.accounts, master),
         ledger_txn_ids=ledger_txn_ids,
+        primary_ack_no=primary_ack_no,
     )
 
 
-def _dossier_config(scope: DossierScope, case_reference: str) -> DossierConfig:
-    return DossierConfig(scope=scope, case_reference=case_reference)
+def _domain_weights(config: RiskConfig) -> dict[str, float]:
+    """Dossier sub-score weights must reproduce the scorer that produced them."""
+    return {
+        "pass_through": config.pass_through_weight,
+        "smurfing": config.smurfing_weight,
+        "cycle": config.cycle_weight,
+        "shared_metadata": config.shared_metadata_weight,
+        "terminal_cashout": config.terminal_cashout_weight,
+        "complaint": config.complaint_weight,
+        "anomaly": config.anomaly_weight * 100.0,
+    }
+
+
+def _dossier_config(
+    scope: DossierScope, case_reference: str, risk_config: RiskConfig
+) -> DossierConfig:
+    return DossierConfig(
+        scope=scope,
+        case_reference=case_reference,
+        domain_weights=_domain_weights(risk_config),
+    )
 
 
 def build_account_dossier(
@@ -319,7 +343,7 @@ def build_account_dossier(
 ) -> InvestigationDossier:
     return InvestigationDossierGenerator(
         [build_dossier_account(bundle, account_no)],
-        _dossier_config("ACCOUNT", f"PG-AC-{account_no}"),
+        _dossier_config("ACCOUNT", f"PG-AC-{account_no}", bundle.risk_config),
     ).build()
 
 
@@ -332,7 +356,9 @@ def build_cluster_dossier(
     return InvestigationDossierGenerator(
         accounts,
         _dossier_config(
-            "CLUSTER", "PG-CL-" + "-".join(sorted(set(account_nos))[:3])
+            "CLUSTER",
+            "PG-CL-" + "-".join(sorted(set(account_nos))[:3]),
+            bundle.risk_config,
         ),
     ).build()
 
@@ -360,15 +386,18 @@ def build_complaint_dossier(
             txn_ids.add(disputed)
     else:
         return InvestigationDossierGenerator(
-            [], _dossier_config("COMPLAINT", f"PG-ACK-{ack_no}")
+            [], _dossier_config("COMPLAINT", f"PG-ACK-{ack_no}", bundle.risk_config)
         ).build()
     scoped = frozenset(txn_ids)
     accounts = [
-        build_dossier_account(bundle, number, ledger_txn_ids=scoped)
+        build_dossier_account(
+            bundle, number, ledger_txn_ids=scoped, primary_ack_no=ack_no
+        )
         for number in sorted(involved)
     ]
     return InvestigationDossierGenerator(
-        accounts, _dossier_config("COMPLAINT", f"PG-ACK-{ack_no}")
+        accounts,
+        _dossier_config("COMPLAINT", f"PG-ACK-{ack_no}", bundle.risk_config),
     ).build()
 
 
@@ -403,11 +432,27 @@ class AccountDetailView:
     dossier: InvestigationDossier
 
 
+def _metadata_text(value: object) -> str | None:
+    """Render one account-master value for display without silently dropping it."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return None
+    return str(value)
+
+
 def build_account_detail(
     bundle: PipelineBundle, account_no: str
 ) -> AccountDetailView:
-    dossier = build_account_dossier(bundle, account_no)
     account = build_dossier_account(bundle, account_no)
+    dossier = InvestigationDossierGenerator(
+        [account],
+        _dossier_config("ACCOUNT", f"PG-AC-{account_no}", bundle.risk_config),
+    ).build()
     sub_scores: tuple[SubScoreRow, ...] = ()
     if dossier.risk_summary is not None:
         sub_scores = tuple(
@@ -433,9 +478,9 @@ def build_account_detail(
         ))
     timeline.sort(key=lambda row: (row.timestamp, row.txn_id))
     metadata = {
-        key: as_str(value)
+        key: rendered
         for key, value in (account.metadata or {}).items()
-        if isinstance(value, str)
+        if (rendered := _metadata_text(value)) is not None
     }
     return AccountDetailView(
         account_no=account_no, metadata=metadata, risk=account.risk,

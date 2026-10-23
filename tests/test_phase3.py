@@ -20,6 +20,7 @@ from core.contracts import (
     MoneyTrail,
     MoneyTrailLeg,
     RiskAssessment,
+    RiskConfig,
 )
 from export.dossier import (
     DossierAccount,
@@ -709,6 +710,100 @@ def test_markdown_escapes_values_outside_tables() -> None:
     assert "&lt;script&gt;" in markdown
     assert "<b>A</b>" not in markdown
     assert "U&lt;1&gt;" in markdown
+
+
+def test_account_detail_traces_the_money_trail_once(monkeypatch) -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    calls: list[str] = []
+    original = bundle.analyzer.trace_money_trail
+
+    def counted(account_no: str, *, max_hops: int | None = None) -> MoneyTrail:
+        calls.append(account_no)
+        return original(account_no, max_hops=max_hops)
+
+    monkeypatch.setattr(bundle.analyzer, "trace_money_trail", counted)
+    build_account_detail(bundle, "HUB")
+    assert calls == ["HUB"]           # one DossierAccount, one trace
+
+
+def test_account_detail_metadata_formats_dates_instead_of_dropping_them() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    detail = build_account_detail(bundle, "HUB")
+    # metadata values are strings for renderers; dates become ISO, never vanish
+    assert detail.metadata["account_opening_date"] == "2024-05-01"
+    assert detail.metadata["mobile_no"] == "9876543210"
+
+
+def test_account_fact_states_device_and_mobile_status() -> None:
+    present = DossierAccount(account_no="MULE", metadata=_account_row("MULE"))
+    record = next(
+        fact for fact in InvestigationDossierGenerator([present]).build().facts
+        if fact.category == "ACCOUNT"
+    )
+    assert "mobile 9876543210" in record.value
+    assert "IMEI 351104510123456" in record.value
+
+    absent = DossierAccount(
+        account_no="BLANK", metadata=_account_row("BLANK", mobile_no=None, imei=None)
+    )
+    record = next(
+        fact for fact in InvestigationDossierGenerator([absent]).build().facts
+        if fact.category == "ACCOUNT"
+    )
+    assert "mobile not recorded" in record.value
+    assert "IMEI not recorded" in record.value
+
+
+def test_shared_kyc_facts_are_capped_with_a_truncation_notice() -> None:
+    peers = tuple(
+        _account_row(f"P{i:02d}", imei="351104510123456") for i in range(30)
+    )
+    account = DossierAccount(
+        account_no="MULE", metadata=_account_row("MULE"), imei_peers=peers
+    )
+    dossier = InvestigationDossierGenerator(
+        [account], DossierConfig(max_kyc_peers=25)
+    ).build()
+    shared = [fact for fact in dossier.facts if fact.category == "SHARED_KYC"]
+    peer_facts = [fact for fact in shared if fact.source == "account_master"]
+    assert len(peer_facts) == 25
+    notice = next(fact for fact in shared if fact.label == "Shared-KYC listing truncated")
+    assert "25 of 30" in notice.value
+    assert notice.source == "generator"
+
+
+def test_dossier_domain_weights_inherit_from_the_pipeline_risk_config() -> None:
+    bundle = run_pipeline(
+        *_pipeline_frames(),
+        risk_config=RiskConfig(smurfing_weight=77.0, anomaly_weight=0.33),
+    )
+    dossier = build_account_dossier(bundle, "HUB")
+    assert dossier.risk_summary is not None
+    weights = {score.domain: score.weight for score in dossier.risk_summary.sub_scores}
+    assert weights["smurfing"] == 77.0
+    assert round(weights["anomaly"], 3) == 33.0
+
+
+def test_complaint_dossier_lists_the_subject_ack_first_and_labels_related_ones() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    dossier = build_complaint_dossier(bundle, "ACK2")
+    complaints = [fact for fact in dossier.facts if fact.category == "COMPLAINT"]
+    assert complaints
+    assert complaints[0].ack_no == "ACK2"      # the subject complaint comes first
+    related = [fact for fact in complaints if fact.ack_no == "ACK1"]
+    assert related
+    assert all(
+        fact.label.startswith("Related corroborating NCRP complaint")
+        for fact in related
+    )
+
+
+def test_account_dossier_complaint_labels_stay_plain() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    dossier = build_account_dossier(bundle, "HUB")
+    complaints = [fact for fact in dossier.facts if fact.category == "COMPLAINT"]
+    assert complaints
+    assert not any(fact.label.startswith("Related corroborating") for fact in complaints)
 
 
 def test_trail_graph_routes_complaint_acks_by_membership_not_prefix() -> None:
