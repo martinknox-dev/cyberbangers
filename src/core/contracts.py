@@ -270,8 +270,8 @@ class RiskConfig(BaseModel):
     cycle_threshold: int = Field(default=1, ge=0)
     min_rows_for_anomaly: int = Field(default=10, ge=1)
     max_explanations: int = Field(default=3, ge=1, le=10)
-    high_risk_band: float = Field(default=70.0, ge=0.0, le=100.0)
-    medium_risk_band: float = Field(default=40.0, ge=0.0, le=100.0)
+    high_risk_band: float = Field(default=55.0, ge=0.0, le=100.0)
+    medium_risk_band: float = Field(default=30.0, ge=0.0, le=100.0)
     # Mirrors the feature extractor's thresholds; used to phrase the applied
     # threshold in the explanation text.
     pass_through_window_minutes: int = Field(default=15, ge=1)

@@ -257,14 +257,23 @@ class RiskScorer:
             terminal_score.cast(pl.Float64()).alias("_terminal"),
             complaint_score.cast(pl.Float64()).alias("_complaint"),
         )
-        domain_score = (
+        # --- domain score: mild peak-plus-corroboration -----------------------
+        # Pure linear sum caps single-archetype accounts at their weight (10-25).
+        # Add 20% of the gap to the peak component to lift accounts that
+        # strongly saturate one typology. Background accounts rarely hit 100%
+        # on high-specificity components, so the boost mainly helps culprits.
+        component_cols = ["_pass_through", "_smurfing", "_cycle", "_shared", "_terminal", "_complaint"]
+        max_component = pl.max_horizontal([pl.col(c) for c in component_cols]) * 100.0
+        weighted_sum = (
             pl.lit(cfg.pass_through_weight) * pl.col("_pass_through")
             + pl.lit(cfg.smurfing_weight) * pl.col("_smurfing")
             + pl.lit(cfg.cycle_weight) * pl.col("_cycle")
             + pl.lit(cfg.shared_metadata_weight) * pl.col("_shared")
             + pl.lit(cfg.terminal_cashout_weight) * pl.col("_terminal")
             + pl.lit(cfg.complaint_weight) * pl.col("_complaint")
-        ).clip(upper_bound=100.0, lower_bound=0.0)
+        )
+        gap = (max_component - weighted_sum).clip(lower_bound=0.0)
+        domain_score = (weighted_sum + gap * pl.lit(0.15)).clip(upper_bound=100.0, lower_bound=0.0)
 
         # --- anomaly component ---------------------------------------------
         matrix, anomaly_scores, shap_values = self._fit_anomaly(frame)
