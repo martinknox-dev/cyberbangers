@@ -50,6 +50,25 @@ from ui.state import (
 
 BASE = datetime(2024, 6, 1, 10, 0)
 APP_PATH = Path(__file__).resolve().parents[1] / "src" / "ui" / "app.py"
+SAMPLE_DIR = Path(__file__).resolve().parents[1] / "data" / "sample_uploads"
+
+
+class _UploadedFile:
+    """Minimal stand-in for Streamlit's UploadedFile in pure tests."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def getvalue(self) -> bytes:
+        return self._path.read_bytes()
+
+
+def _sample_files() -> tuple[Path, Path, Path]:
+    return (
+        SAMPLE_DIR / "transactions_messy_bank_export.csv",
+        SAMPLE_DIR / "account_master_kyc.xlsx",
+        SAMPLE_DIR / "ncrp_complaints_interstate.csv",
+    )
 
 
 def _feature_row(account_no: str, **overrides: object) -> dict[str, object]:
@@ -804,6 +823,89 @@ def test_account_dossier_complaint_labels_stay_plain() -> None:
     complaints = [fact for fact in dossier.facts if fact.category == "COMPLAINT"]
     assert complaints
     assert not any(fact.label.startswith("Related corroborating") for fact in complaints)
+
+
+def test_sample_uploads_ingest_through_the_upload_helper_with_audit_rows() -> None:
+    from ui.app import _load_uploaded
+
+    txn_path, acc_path, cmp_path = _sample_files()
+    transactions, txn_report = _load_uploaded(_UploadedFile(txn_path), "transactions")
+    accounts, acc_report = _load_uploaded(_UploadedFile(acc_path), "accounts")
+    complaints, cmp_report = _load_uploaded(_UploadedFile(cmp_path), "complaints")
+
+    assert txn_report.rows_rejected == 5
+    assert txn_report.rows_accepted == transactions.height > 0
+    assert txn_report.failure_counts == {
+        "unparseable_amount": 1, "missing:txn_id": 1, "duplicate_utr": 1,
+        "negative_amount": 1, "unparseable_timestamp": 1,
+    }
+    # alternate bank-export headers must map to the canonical ledger schema
+    assert txn_report.column_mapping["UTR"].canonical_name == "txn_id"
+    assert txn_report.column_mapping["Debit_Acc"].canonical_name == "sender_account"
+    assert txn_report.column_mapping["PAYEE"].canonical_name == "receiver_account"
+    assert txn_report.column_mapping["Amount_INR"].canonical_name == "amount"
+    assert txn_report.column_mapping["Txn_Time"].canonical_name == "timestamp"
+
+    assert acc_report.rows_rejected == 0
+    assert accounts.height == 7
+    assert cmp_report.rows_rejected == 0
+    assert complaints.height == 3
+    assert cmp_report.column_mapping["ACK"].canonical_name == "ack_no"
+    assert cmp_report.column_mapping["Disputed_UTR"].canonical_name == "disputed_utr"
+    assert cmp_report.column_mapping["State"].canonical_name == "state"
+
+    bundle = state.run_pipeline(
+        transactions, accounts, complaints,
+        reports={
+            "transactions": txn_report,
+            "accounts": acc_report,
+            "complaints": cmp_report,
+        },
+    )
+    assert bundle.assessments
+    assert bundle.reports["transactions"].rows_rejected == 5
+
+
+def test_sample_account_workbook_has_fixed_archive_metadata() -> None:
+    import zipfile
+
+    path = _sample_files()[1]
+    with zipfile.ZipFile(path) as archive:
+        core = archive.read("docProps/core.xml").decode("utf-8")
+        stamps = {info.date_time for info in archive.infolist()}
+    # regeneration must be byte-stable: no wall-clock stamps anywhere
+    assert core.count("2024-06-01T00:00:00Z") == 2
+    assert stamps == {(2024, 6, 1, 0, 0, 0)}
+
+
+def test_app_upload_branch_builds_a_bundle_from_sample_files() -> None:
+    from streamlit.testing.v1 import AppTest
+
+    txn_path, acc_path, cmp_path = _sample_files()
+    app = AppTest.from_file(str(APP_PATH), default_timeout=300)
+    app.run()
+    app.file_uploader(key="up_txn").set_value(
+        (txn_path.name, txn_path.read_bytes(), "text/csv")
+    )
+    app.file_uploader(key="up_acc").set_value((
+        acc_path.name, acc_path.read_bytes(),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ))
+    app.file_uploader(key="up_cmp").set_value(
+        (cmp_path.name, cmp_path.read_bytes(), "text/csv")
+    )
+    app.button(key="load_uploads").click().run()
+    assert not app.exception, [str(item) for item in app.exception]
+
+    metrics = {
+        item.label: int(str(item.value).replace(",", ""))
+        for item in app.metric
+    }
+    assert metrics["Rejected"] == 5
+    assert metrics["Rows total"] == metrics["Accepted"] + metrics["Rejected"]
+    assert any(
+        "transactions" in str(item.value).lower() for item in app.subheader
+    )
 
 
 def test_trail_graph_routes_complaint_acks_by_membership_not_prefix() -> None:

@@ -78,7 +78,7 @@ CANONICAL_SYNONYMS: Final[dict[str, tuple[str, ...]]] = {
 COMPLAINT_SYNONYMS: Final[dict[str, tuple[str, ...]]] = {
     "ack_no": (
         "ack_no", "acknowledgement_no", "acknowledgment_no", "complaint_ack",
-        "complaint_no", "ncrp_ack",
+        "complaint_no", "ncrp_ack", "ack",
     ),
     "victim_account": (
         "victim_account", "victim_acc_no", "complainant_account",
