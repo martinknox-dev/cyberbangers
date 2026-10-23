@@ -8,6 +8,7 @@ is labelled as such; Section C is a draft requisition for legal review.
 
 from __future__ import annotations
 
+import html
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -98,6 +99,35 @@ def bank_name_for(ifsc: str | None, table: Mapping[str, str]) -> str:
 def rejected_rows_csv(report: IngestionReport) -> bytes:
     """Audit CSV of rejected rows, exactly as captured during ingestion."""
     return report.rejected_rows.write_csv().encode("utf-8")
+
+
+def _md_cell(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _html_text(value: object) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _html_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> str:
+    head = "".join(f"<th>{_html_text(cell)}</th>" for cell in headers)
+    body = "".join(
+        "<tr>" + "".join(f"<td>{_html_text(cell)}</td>" for cell in row) + "</tr>"
+        for row in rows
+    )
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+
+_PRINT_CSS: str = (
+    "body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;"
+    "max-width:960px;margin:2rem auto;padding:0 1rem;color:#111;line-height:1.45}"
+    "h1{font-size:1.6rem}h2{margin-top:2rem;border-bottom:2px solid #111;padding-bottom:.25rem}"
+    "table{border-collapse:collapse;width:100%;font-size:.85rem;margin:.5rem 0 1rem}"
+    "th,td{border:1px solid #999;padding:.35rem .5rem;text-align:left;vertical-align:top}"
+    "th{background:#eee}.meta{color:#444;font-size:.85rem}"
+    ".note{border-left:4px solid #b00;padding:.5rem .75rem;background:#fdf3f3;font-size:.85rem}"
+    "@media print{body{margin:0}h2{page-break-after:avoid}table{page-break-inside:auto}}"
+)
 
 
 @dataclass(frozen=True)
@@ -433,6 +463,143 @@ class InvestigationDossierGenerator:
                 "authorised to issue it."
             ),
         )
+
+    # --- renderers --------------------------------------------------------
+    def _generated_on_text(self) -> str:
+        generated_on = self._config.generated_on
+        return generated_on.isoformat() if generated_on is not None else "not recorded"
+
+    def render_markdown(self, dossier: InvestigationDossier | None = None) -> str:
+        data = dossier or self.build()
+        lines = [
+            f"# Case Evidence Dossier — {data.case_reference}", "",
+            f"**Scope:** {data.scope}  ",
+            f"**Subject accounts:** {', '.join(data.subject_accounts) or 'none'}  ",
+            f"**Generated on:** {self._generated_on_text()}  ", "",
+            "## Section A — Verified Evidentiary Facts", "",
+            "> Records exactly as supplied by the source systems. Not a certified copy.", "",
+            "| Category | Record | Detail | Source |", "| :--- | :--- | :--- | :--- |",
+        ]
+        for fact in data.facts:
+            lines.append(
+                f"| {_md_cell(fact.category)} | {_md_cell(fact.label)} | "
+                f"{_md_cell(fact.value)} | {_md_cell(fact.source)} |"
+            )
+        lines += ["", "## Section B — Analytical & AI Risk Indicators", "",
+                  "> Automated analysis. Investigative leads, not evidence.", ""]
+        if data.risk_summary is not None:
+            summary = data.risk_summary
+            lines += [
+                (
+                    f"**Risk score:** {summary.risk_score:.2f}/100 "
+                    f"({summary.risk_band}) · domain {summary.domain_score:.2f} · "
+                    f"anomaly {summary.anomaly_score:.2f} · "
+                    f"archetype: {summary.top_archetype}"
+                ),
+                "",
+                "| Sub-score | Value | Weight | Points |",
+                "| :--- | ---: | ---: | ---: |",
+            ]
+            for score in summary.sub_scores:
+                lines.append(f"| {_md_cell(score.label)} | {score.value:.1f} | "
+                             f"{score.weight:.0f} | {score.points:.1f} |")
+            lines.append("")
+        lines += ["| Indicator | Method | Value | Explanation |",
+                  "| :--- | :--- | ---: | :--- |"]
+        for indicator in data.indicators:
+            lines.append(f"| {_md_cell(indicator.indicator)} | {_md_cell(indicator.method)} | "
+                         f"{indicator.value:.4f} | {_md_cell(indicator.explanation)} |")
+        lines += ["", "## Section C — Section 94 BNSS Requisition (Draft)", "",
+                  f"**{data.requisition.subject}**", "",
+                  f"To: {data.requisition.addressee}", ""]
+        lines += [f"{paragraph}" for paragraph in data.requisition.paragraphs]
+        for group in data.requisition.bank_requests:
+            lines += ["", f"### {group.bank_name} (IFSC prefix {group.ifsc_prefix})", "",
+                      f"- Accounts: {', '.join(group.accounts) or 'none'}",
+                      f"- Transaction references: {', '.join(group.utrs) or 'none'}",
+                      "- Documents required:"]
+            lines += [f"  - {document}" for document in group.documents]
+        lines += ["", f"*{data.requisition.legal_note}*", "",
+                  f"**Disclaimer:** {data.disclaimer}", ""]
+        return "\n".join(lines)
+
+    def render_html(self, dossier: InvestigationDossier | None = None) -> bytes:
+        data = dossier or self.build()
+        fact_rows: list[list[object]] = [
+            [fact.category, fact.label, fact.value, fact.source] for fact in data.facts
+        ]
+        parts: list[str] = [
+            "<!DOCTYPE html>",
+            '<html lang="en"><head><meta charset="utf-8">',
+            f"<title>Case Evidence Dossier — {_html_text(data.case_reference)}</title>",
+            f"<style>{_PRINT_CSS}</style></head><body>",
+            f"<h1>Case Evidence Dossier — {_html_text(data.case_reference)}</h1>",
+            '<p class="meta">',
+            f"<strong>Scope:</strong> {_html_text(data.scope)}<br>",
+            (
+                "<strong>Subject accounts:</strong> "
+                f"{_html_text(', '.join(data.subject_accounts) or 'none')}<br>"
+            ),
+            f"<strong>Generated on:</strong> {_html_text(self._generated_on_text())}",
+            "</p>",
+            "<h2>Section A — Verified Evidentiary Facts</h2>",
+            (
+                '<p class="note">Records exactly as supplied by the source systems. '
+                "Not a certified copy.</p>"
+            ),
+            _html_table(["Category", "Record", "Detail", "Source"], fact_rows),
+            "<h2>Section B — Analytical &amp; AI Risk Indicators</h2>",
+            '<p class="note">Automated analysis. Investigative leads, not evidence.</p>',
+        ]
+        if data.risk_summary is not None:
+            summary = data.risk_summary
+            parts.append(
+                f"<p><strong>Risk score:</strong> {summary.risk_score:.2f}/100 "
+                f"({_html_text(summary.risk_band)}) · domain "
+                f"{summary.domain_score:.2f} · anomaly {summary.anomaly_score:.2f} · "
+                f"archetype: {_html_text(summary.top_archetype)}</p>"
+            )
+            parts.append(_html_table(
+                ["Sub-score", "Value", "Weight", "Points"],
+                [[score.label, f"{score.value:.1f}", f"{score.weight:.0f}",
+                  f"{score.points:.1f}"] for score in summary.sub_scores],
+            ))
+        parts.append(_html_table(
+            ["Indicator", "Method", "Value", "Explanation"],
+            [[indicator.indicator, indicator.method, f"{indicator.value:.4f}",
+              indicator.explanation] for indicator in data.indicators],
+        ))
+        requisition = data.requisition
+        parts += [
+            "<h2>Section C — Section 94 BNSS Requisition (Draft)</h2>",
+            f"<p><strong>{_html_text(requisition.subject)}</strong></p>",
+            f"<p>To: {_html_text(requisition.addressee)}</p>",
+        ]
+        parts += [f"<p>{_html_text(paragraph)}</p>" for paragraph in requisition.paragraphs]
+        for group in requisition.bank_requests:
+            parts.append(
+                f"<h3>{_html_text(group.bank_name)} "
+                f"(IFSC prefix {_html_text(group.ifsc_prefix)})</h3>"
+            )
+            parts.append(_html_table(
+                ["Accounts", "Transaction references"],
+                [[", ".join(group.accounts) or "none",
+                  ", ".join(group.utrs) or "none"]],
+            ))
+            parts.append(_html_table(["Documents required"], [[doc] for doc in group.documents]))
+        parts += [
+            f"<p><em>{_html_text(requisition.legal_note)}</em></p>",
+            (
+                f'<p class="note"><strong>Disclaimer:</strong> '
+                f"{_html_text(data.disclaimer)}</p>"
+            ),
+            "</body></html>",
+        ]
+        return "".join(parts).encode("utf-8")
+
+    def render_json(self, dossier: InvestigationDossier | None = None) -> bytes:
+        data = dossier or self.build()
+        return data.model_dump_json(indent=2).encode("utf-8")
 
     # --- assembly ---------------------------------------------------------
     def build(self) -> InvestigationDossier:

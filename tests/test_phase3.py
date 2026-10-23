@@ -12,6 +12,7 @@ from core.contracts import (
     GRAPH_INDICATOR_SCHEMA,
     REQUISITION_DOCUMENTS,
     IngestionReport,
+    InvestigationDossier,
     MoneyTrail,
     MoneyTrailLeg,
     RiskAssessment,
@@ -331,3 +332,43 @@ def test_requisition_handles_an_account_without_ifsc() -> None:
     group = dossier.requisition.bank_requests[0]
     assert group.ifsc_prefix == "UNKNOWN"
     assert "not identified" in group.bank_name.lower()
+
+
+def test_renderers_are_deterministic() -> None:
+    first = _generator().render_json()
+    second = _generator().render_json()
+    assert first == second
+    assert _generator().render_markdown() == _generator().render_markdown()
+    assert _generator().render_html() == _generator().render_html()
+
+
+def test_json_round_trips_through_the_contract() -> None:
+    dossier = _generator().build()
+    restored = InvestigationDossier.model_validate_json(_generator().render_json())
+    assert restored == dossier
+
+
+def test_html_is_self_contained_and_print_ready() -> None:
+    payload = _generator().render_html().decode("utf-8")
+    assert payload.startswith("<!DOCTYPE html>")
+    assert "http://" not in payload and "https://" not in payload
+    assert "<script" not in payload.lower()
+    assert "@media print" in payload
+    assert "Section A" in payload and "Section B" in payload and "Section C" in payload
+
+
+def test_values_are_escaped_in_html_and_markdown() -> None:
+    hostile = DossierAccount(
+        account_no="<script>alert(1)</script>",
+        metadata=_account_row("A1", branch_code="BR|042"),
+        transactions=(_txn("U1", "VICTIM", "A1", 10.0, 0),),
+    )
+    generator = InvestigationDossierGenerator([hostile])
+    html_payload = generator.render_html().decode("utf-8")
+    assert "<script>alert(1)</script>" not in html_payload
+    assert "&lt;script&gt;" in html_payload
+    markdown = generator.render_markdown()
+    table_rows = [line for line in markdown.splitlines() if line.startswith("|")]
+    widths = {line.count("|") - line.count("\\|") for line in table_rows}
+    assert len(widths) == 1                 # no value can break the table structure
+    assert "BR\\|042" in markdown           # the pipe is escaped, not dropped
