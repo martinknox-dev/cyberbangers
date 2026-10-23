@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from core.coerce import as_date, as_datetime, as_float, as_str
 from core.contracts import (
     BNSS_SECTION_94,
+    BNSS_SECTION_106,
     DOMAIN_KEYS,
     DOMAIN_LABELS,
     DOSSIER_DISCLAIMER,
@@ -31,6 +32,7 @@ from core.contracts import (
     IngestionReport,
     InvestigationDossier,
     MoneyTrail,
+    RequisitionRequest,
     RiskAssessment,
     WashCycle,
 )
@@ -362,6 +364,76 @@ class InvestigationDossierGenerator:
             sub_scores=sub_scores,
         )
 
+    # --- Section C --------------------------------------------------------
+    def _requisition(self) -> DossierRequisition:
+        config = self._config
+        groups: dict[str, dict[str, set[str]]] = {}
+        names: dict[str, str] = {}
+        for account in self._accounts:
+            ifsc = as_str((account.metadata or {}).get("ifsc"))
+            prefix = ifsc[:4].upper() if ifsc else "UNKNOWN"
+            names.setdefault(prefix, bank_name_for(ifsc, config.bank_names))
+            bucket = groups.setdefault(prefix, {"accounts": set(), "utrs": set()})
+            bucket["accounts"].add(account.account_no)
+            allowed = account.ledger_txn_ids
+            for leg in account.transactions:
+                txn_id = as_str(leg.get("txn_id"))
+                if not txn_id or (allowed is not None and txn_id not in allowed):
+                    continue
+                bucket["utrs"].add(txn_id)
+            for row in account.complaints:
+                txn_id = as_str(row.get("disputed_utr"))
+                if txn_id and (allowed is None or txn_id in allowed):
+                    bucket["utrs"].add(txn_id)
+
+        bank_requests = [
+            RequisitionRequest(
+                ifsc_prefix=prefix,
+                bank_name=names[prefix],
+                accounts=sorted(groups[prefix]["accounts"]),
+                utrs=sorted(groups[prefix]["utrs"]),
+                documents=list(config.requested_documents),
+            )
+            for prefix in sorted(groups)
+        ]
+        case = config.case_reference
+        paragraphs = [
+            (f"Whereas an investigation is being conducted in case {case} into "
+             "offences relating to cheating and dishonest misappropriation "
+             "committed through electronic payment channels, and the accounts "
+             "and transaction references listed below are reasonably connected "
+             "with that investigation;"),
+            ("And whereas the records sought below are required for the purpose "
+             "of the investigation and are expected to be in your custody or "
+             "control in electronic form;"),
+            (f"Now therefore, in exercise of the powers under {BNSS_SECTION_94}, "
+             "you are hereby directed to cause production of the documents "
+             "listed against your bank, in electronic form where available, "
+             f"within {config.deadline_days} days of receipt of this "
+             "requisition, duly certified by an authorised officer;"),
+            ("This requisition is limited to the production of records. Any "
+             "requirement of lien marking, freezing or seizure shall be pursued "
+             f"separately through the CFCFRMS process and {BNSS_SECTION_106}, "
+             "as applicable, and is not covered by this communication;"),
+            ("A compliance report identifying the officer who certified the "
+             "records, the date of production and any record that could not be "
+             "produced (with reasons) shall accompany the response."),
+        ]
+        return DossierRequisition(
+            statute_reference=BNSS_SECTION_94,
+            addressee="The Nodal Officer of each bank listed below",
+            subject=f"Production of records under {BNSS_SECTION_94} — case {case}",
+            case_reference=case,
+            paragraphs=paragraphs,
+            bank_requests=bank_requests,
+            legal_note=(
+                "Draft for review by the competent investigating officer. This "
+                "document is not legal advice, does not certify the records "
+                "listed in Section A, and must be signed by an officer "
+                "authorised to issue it."
+            ),
+        )
+
     # --- assembly ---------------------------------------------------------
     def build(self) -> InvestigationDossier:
         if self._built is not None:
@@ -386,18 +458,7 @@ class InvestigationDossierGenerator:
                 for indicator in self._indicators_for(account)
             ],
             risk_summary=self._risk_summary(),
-            # Minimal valid requisition: Task 4 replaces this inline literal with
-            # `requisition=self._requisition()` (bank-grouped, Section 94 BNSS).
-            requisition=DossierRequisition(
-                statute_reference=BNSS_SECTION_94,
-                addressee="The Nodal Officer of each bank listed below",
-                subject=(
-                    f"Production of records under {BNSS_SECTION_94} — "
-                    f"case {self._config.case_reference}"
-                ),
-                case_reference=self._config.case_reference,
-                legal_note="Draft for review by the competent investigating officer.",
-            ),
+            requisition=self._requisition(),
             disclaimer=DOSSIER_DISCLAIMER,
         )
         self._built = dossier

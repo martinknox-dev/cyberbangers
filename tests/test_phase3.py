@@ -10,6 +10,7 @@ from core.contracts import (
     ACCOUNT_FEATURE_SCHEMA,
     DOMAIN_KEYS,
     GRAPH_INDICATOR_SCHEMA,
+    REQUISITION_DOCUMENTS,
     IngestionReport,
     MoneyTrail,
     MoneyTrailLeg,
@@ -282,3 +283,51 @@ def test_account_without_risk_still_produces_an_empty_section_b() -> None:
     dossier = InvestigationDossierGenerator([DossierAccount(account_no="GHOST")]).build()
     assert dossier.indicators == []
     assert dossier.risk_summary is None
+
+
+def test_requisition_cites_section_94_and_keeps_lien_marking_separate() -> None:
+    dossier = _generator().build()
+    req = dossier.requisition
+    assert req.statute_reference == (
+        "Section 94 of the Bharatiya Nagarik Suraksha Sanhita, 2023 (BNSS)"
+    )
+    assert "Nodal Officer" in req.addressee
+    body = " ".join(req.paragraphs)
+    assert "Section 94" in body
+    assert "Section 106" in body and "CFCFRMS" in body
+    assert "separate" in body.lower()
+    assert "not legal advice" in req.legal_note.lower()
+    assert dossier.disclaimer.startswith("Section A reproduces records")
+
+
+def test_requisition_groups_accounts_by_bank_and_lists_only_their_utrs() -> None:
+    axis = DossierAccount(
+        account_no="A1", metadata=_account_row("A1", ifsc="UTIB0000123"),
+        # both legs touch A1: it receives U-AXIS and sends U-SBI
+        transactions=(_txn("U-AXIS", "VICTIM", "A1", 100.0, 0),
+                      _txn("U-SBI", "A1", "S1", 90.0, 5)),
+    )
+    sbi = DossierAccount(
+        account_no="S1", metadata=_account_row("S1", ifsc="SBIN0000421"),
+        transactions=(_txn("U-SBI", "A1", "S1", 90.0, 5),),
+    )
+    dossier = InvestigationDossierGenerator([axis, sbi]).build()
+    groups = {group.ifsc_prefix: group for group in dossier.requisition.bank_requests}
+    assert groups["UTIB"].bank_name == "Axis Bank"
+    assert groups["SBIN"].bank_name == "State Bank of India"
+    assert groups["UTIB"].accounts == ["A1"]
+    assert groups["SBIN"].accounts == ["S1"]
+    # A1 is the sender of U-SBI, so both banks must be asked about that leg
+    assert {"U-AXIS", "U-SBI"} <= set(groups["UTIB"].utrs)
+    assert "U-AXIS" not in groups["SBIN"].utrs      # S1 never touches the Axis leg
+    assert groups["SBIN"].utrs == ["U-SBI"]
+    assert groups["SBIN"].documents == list(REQUISITION_DOCUMENTS)
+
+
+def test_requisition_handles_an_account_without_ifsc() -> None:
+    account = DossierAccount(account_no="NOIFSC",
+                             metadata=_account_row("NOIFSC", ifsc=None))
+    dossier = InvestigationDossierGenerator([account]).build()
+    group = dossier.requisition.bank_requests[0]
+    assert group.ifsc_prefix == "UNKNOWN"
+    assert "not identified" in group.bank_name.lower()
