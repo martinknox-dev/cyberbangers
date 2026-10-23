@@ -29,13 +29,19 @@ from export.dossier import (
 )
 from ingestion.mapper import DatasetIngester
 from risk.scorer import RiskScorer
+from simulator.generator import SyndicateDataSimulator
 from ui.state import (
     build_account_detail,
     build_account_dossier,
     build_cluster_dossier,
+    build_collusion_view,
     build_complaint_dossier,
+    build_correlation_view,
+    build_cycle_view,
     build_ingestion_view,
     build_leaderboard,
+    build_terminal_view,
+    build_trail_graph,
     run_pipeline,
 )
 
@@ -522,3 +528,85 @@ def test_cluster_dossier_covers_every_selected_account() -> None:
     assert [fact.account_no for fact in account_facts] == ["HUB", "M2"]
     assert dossier.risk_summary is not None
     assert dossier.risk_summary.account_no == "HUB"      # highest score
+
+
+def test_trail_graph_is_traceable_by_account_utr_and_complaint() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    by_account = build_trail_graph(bundle, start="HUB", max_hops=2)
+    assert by_account.edges and all(edge.taint_amount > 0 for edge in by_account.edges)
+    assert {node.id for node in by_account.nodes} >= {"HUB", "M2", "TERM"}
+
+    by_utr = build_trail_graph(bundle, start="T1", max_hops=2)
+    assert by_utr.origin_label.endswith("T1")
+    assert all(edge.txn_id != "T1" for edge in by_utr.edges)   # origin leg, not a trail leg
+
+    by_ack = build_trail_graph(bundle, start="ACK1", max_hops=2)
+    assert any(edge.txn_id == "T1" for edge in by_ack.edges)  # complaint-scoped seed leg
+
+
+def test_trail_graph_elements_are_renderable_and_deterministic() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    view = build_trail_graph(bundle, start="HUB", max_hops=3)
+    assert view.elements == build_trail_graph(bundle, start="HUB", max_hops=3).elements
+    node_ids = {node["data"]["id"] for node in view.elements["nodes"]}
+    assert all(edge["data"]["source"] in node_ids for edge in view.elements["edges"])
+    assert all(edge["data"]["target"] in node_ids for edge in view.elements["edges"])
+    terminal = next(node for node in view.nodes if node.id == "TERM")
+    assert terminal.kind == "TERMINAL"
+    assert terminal.risk_band
+
+
+def test_unknown_trace_start_yields_an_empty_canvas() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    view = build_trail_graph(bundle, start="NO-SUCH-ID", max_hops=3)
+    assert view.nodes == () and view.edges == ()
+    assert view.elements == {"nodes": [], "edges": []}
+
+
+def test_collusion_and_terminal_and_correlation_views() -> None:
+    bundle = run_pipeline(*_pipeline_frames())
+    collusion = build_collusion_view(bundle)
+    imei_groups = [group for group in collusion.groups if group.basis == "IMEI"]
+    assert imei_groups and all(len(group.accounts) >= 2 for group in collusion.groups)
+
+    terminals = build_terminal_view(bundle)
+    assert [row.account_no for row in terminals.rows] == ["TERM"]
+    assert terminals.rows[0].terminal_inflow == 93_000.0
+
+    correlation = build_correlation_view(bundle)
+    assert correlation.rows == ()           # no shared evidence in this ledger
+    assert correlation.hotspots == ()
+
+
+def test_cycle_view_lists_a_closed_wash_loop() -> None:
+    # every hop loses <= 15 %, so Phase 2 reports this as a wash cycle
+    transactions = pl.DataFrame([
+        _txn("C1", "A", "B", 100_000.0, 0),
+        _txn("C2", "B", "C", 97_000.0, 10),
+        _txn("C3", "C", "A", 95_000.0, 20),
+    ], schema=TRANSACTION_SCHEMA)
+    view = build_cycle_view(run_pipeline(transactions))
+    assert len(view.rows) == 1
+    row = view.rows[0]
+    assert row.accounts == ("A", "B", "C")
+    assert row.txn_ids == ("C1", "C2", "C3")
+    assert row.total_amount == 292_000.0      # Phase 2 sums the legs
+    assert 0.0 < row.max_decay_ratio <= 0.15
+
+
+def test_correlation_view_flags_interstate_links() -> None:
+    sim = SyndicateDataSimulator(seed=42).generate(background_transactions=5_000)
+    bundle = run_pipeline(sim.transactions, sim.accounts, sim.complaints)
+    view = build_correlation_view(bundle)
+    # the seeded scenario routes three state-distinct complaints through one
+    # AEPS terminal, so links must exist (verified: 3 links, 1 shared terminal)
+    assert view.rows
+    assert any(row.interstate for row in view.rows)
+    assert any(row.shared_terminals for row in view.rows)
+    hotspot = view.hotspots[0]
+    assert len(hotspot.ack_nos) >= 2
+    assert all(item.ack_nos == tuple(sorted(item.ack_nos)) for item in view.hotspots)
+    assert view.hotspots == tuple(
+        sorted(view.hotspots, key=lambda item: (-len(item.ack_nos), item.key))
+    )
+    assert view.rows == tuple(sorted(view.rows, key=lambda item: (item.ack_a, item.ack_b)))

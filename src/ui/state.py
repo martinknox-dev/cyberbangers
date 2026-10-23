@@ -24,6 +24,7 @@ from core.contracts import (
     GraphConfig,
     IngestionReport,
     InvestigationDossier,
+    MoneyTrail,
     RiskAssessment,
     RiskConfig,
     WashCycle,
@@ -444,8 +445,343 @@ def build_account_detail(
     )
 
 
+_TERMINAL_MODES = frozenset({"AEPS", "ATM", "CASH"})
+
+
+@dataclass(frozen=True)
+class GraphNode:
+    id: str
+    label: str
+    kind: str                 # "ACCOUNT" | "TERMINAL"
+    risk_score: float
+    risk_band: str
+    community: int
+    caption: str
+
+
+@dataclass(frozen=True)
+class GraphEdge:
+    id: str
+    source: str
+    target: str
+    txn_id: str
+    amount: float
+    taint_amount: float
+    hop: int
+    timestamp: datetime
+    payment_mode: str
+
+
+@dataclass(frozen=True)
+class GraphView:
+    origin_label: str
+    nodes: tuple[GraphNode, ...]
+    edges: tuple[GraphEdge, ...]
+    elements: dict[str, list[dict[str, dict[str, str]]]]
+
+
+def _node_lookup(bundle: PipelineBundle) -> dict[str, tuple[float, str, int]]:
+    risk = {str(row["account_no"]): row for row in bundle.risk.to_dicts()}
+    graph = {str(row["account_no"]): row for row in bundle.graph.to_dicts()}
+    return {
+        account: (
+            as_float(risk.get(account, {}).get("risk_score")),
+            as_str(risk.get(account, {}).get("risk_band")) or "UNSCORED",
+            as_int(graph.get(account, {}).get("louvain_community_id")),
+        )
+        for account in set(risk) | set(graph)
+    }
+
+
+def _resolve_trail(bundle: PipelineBundle, start: str, max_hops: int) -> MoneyTrail:
+    if start.startswith("ACK"):
+        return bundle.analyzer.trace_complaint_trail(start, max_hops=max_hops)
+    return bundle.analyzer.trace_money_trail(start, max_hops=max_hops)
+
+
+def build_trail_graph(
+    bundle: PipelineBundle, *, start: str, max_hops: int = 3
+) -> GraphView:
+    trail = _resolve_trail(bundle, start, max_hops)
+    lookup = _node_lookup(bundle)
+    legs = sorted(trail.legs, key=lambda leg: (leg.hop, leg.timestamp, leg.txn_id))
+    terminal_nodes = {
+        leg.receiver_account for leg in legs if leg.payment_mode in _TERMINAL_MODES
+    }
+    order: list[str] = []
+    if trail.origin_account and legs:
+        order.append(trail.origin_account)
+    for leg in legs:
+        for account in (leg.sender_account, leg.receiver_account):
+            if account not in order:
+                order.append(account)
+    nodes = tuple(
+        GraphNode(
+            id=account,
+            label=account,
+            kind="TERMINAL" if account in terminal_nodes else "ACCOUNT",
+            risk_score=lookup.get(account, (0.0, "UNSCORED", 0))[0],
+            risk_band=lookup.get(account, (0.0, "UNSCORED", 0))[1],
+            community=lookup.get(account, (0.0, "UNSCORED", 0))[2],
+            caption=f"{account} · {lookup.get(account, (0.0, 'UNSCORED', 0))[1]}",
+        )
+        for account in order
+    )
+    edges = tuple(
+        GraphEdge(
+            id=leg.txn_id, source=leg.sender_account, target=leg.receiver_account,
+            txn_id=leg.txn_id, amount=leg.amount, taint_amount=leg.taint_amount,
+            hop=leg.hop, timestamp=leg.timestamp, payment_mode=leg.payment_mode,
+        )
+        for leg in legs
+    )
+    elements: dict[str, list[dict[str, dict[str, str]]]] = {
+        "nodes": [
+            {"data": {"id": node.id, "label": node.kind.lower(), "caption": node.caption,
+                      "band": node.risk_band}}
+            for node in nodes
+        ],
+        "edges": [
+            {"data": {"id": edge.id, "source": edge.source, "target": edge.target,
+                      "label": f"hop {edge.hop}",
+                      "caption": (f"{edge.txn_id} · ₹{edge.amount:.2f} · "
+                                  f"tainted ₹{edge.taint_amount:.2f}")}}
+            for edge in edges
+        ],
+    }
+    origin_label = (
+        f"UTR {trail.origin_txn_id}" if trail.origin_txn_id
+        else f"A/C {trail.origin_account}"
+    )
+    return GraphView(origin_label=origin_label, nodes=nodes, edges=edges, elements=elements)
+
+
+@dataclass(frozen=True)
+class CycleRow:
+    accounts: tuple[str, ...]        # cycle order, starting at the smallest id
+    txn_ids: tuple[str, ...]
+    total_amount: float
+    max_decay_ratio: float
+    start_timestamp: datetime
+
+
+@dataclass(frozen=True)
+class CycleView:
+    rows: tuple[CycleRow, ...]       # sorted by (-max_decay_ratio, accounts)
+
+
+def build_cycle_view(bundle: PipelineBundle) -> CycleView:
+    rows = [
+        CycleRow(
+            accounts=tuple(cycle.cycle_accounts),
+            txn_ids=tuple(cycle.txn_ids),
+            total_amount=round(cycle.total_amount, 2),
+            max_decay_ratio=cycle.max_decay_ratio,
+            start_timestamp=cycle.start_timestamp,
+        )
+        for cycle in bundle.wash_cycles
+    ]
+    rows.sort(key=lambda row: (-row.max_decay_ratio, row.accounts))
+    return CycleView(rows=tuple(rows))
+
+
+@dataclass(frozen=True)
+class CollusionGroup:
+    basis: str                       # "IMEI" | "BRANCH"
+    key: str                         # the IMEI, or the branch code
+    accounts: tuple[str, ...]        # sorted
+    opening_dates: tuple[str, ...]   # ISO dates or "not recorded"
+
+
+@dataclass(frozen=True)
+class CollusionView:
+    groups: tuple[CollusionGroup, ...]   # sorted by (basis, key)
+
+
+def _opening_dates(rows: Sequence[Mapping[str, object]]) -> tuple[str, ...]:
+    dates: list[str] = []
+    for row in rows:
+        opened = as_date(row.get("account_opening_date"))
+        dates.append(opened.isoformat() if opened is not None else "not recorded")
+    return tuple(dates)
+
+
+def _imei_groups(accounts: pl.DataFrame) -> list[CollusionGroup]:
+    groups: list[CollusionGroup] = []
+    if accounts.height == 0 or "imei" not in accounts.columns:
+        return groups
+    rows = accounts.filter(
+        pl.col("imei").is_not_null() & (pl.col("imei") != "")
+    ).sort(["imei", "account_no"])
+    for key, subset in rows.group_by("imei", maintain_order=True):
+        imei = as_str(key[0] if isinstance(key, tuple) else key)
+        members = subset.sort("account_no")
+        if len(members) < 2:
+            continue
+        groups.append(CollusionGroup(
+            basis="IMEI", key=imei,
+            accounts=tuple(as_str(item.get("account_no")) for item in members.to_dicts()),
+            opening_dates=_opening_dates(members.to_dicts()),
+        ))
+    return groups
+
+
+def _branch_groups(accounts: pl.DataFrame) -> list[CollusionGroup]:
+    groups: list[CollusionGroup] = []
+    if accounts.height == 0 or "branch_code" not in accounts.columns:
+        return groups
+    rows = accounts.filter(
+        pl.col("branch_code").is_not_null() & (pl.col("branch_code") != "")
+        & pl.col("account_opening_date").is_not_null()
+    ).sort(["branch_code", "account_opening_date", "account_no"])
+    for key, subset in rows.group_by("branch_code", maintain_order=True):
+        branch = as_str(key[0] if isinstance(key, tuple) else key)
+        members = subset.sort(["account_opening_date", "account_no"]).to_dicts()
+        cluster: list[dict[str, object]] = []
+        for row in members:
+            opened = as_date(row.get("account_opening_date"))
+            if opened is None:
+                continue
+            if cluster:
+                first = as_date(cluster[0].get("account_opening_date"))
+                if first is None or (opened - first).total_seconds() > 48 * 3600:
+                    if len(cluster) >= 2:
+                        groups.append(_branch_group(branch, cluster))
+                    cluster = []
+            cluster.append(row)
+        if len(cluster) >= 2:
+            groups.append(_branch_group(branch, cluster))
+    return groups
+
+
+def _branch_group(branch: str, cluster: Sequence[Mapping[str, object]]) -> CollusionGroup:
+    ordered = sorted(cluster, key=lambda row: as_str(row.get("account_no")))
+    return CollusionGroup(
+        basis="BRANCH", key=branch,
+        accounts=tuple(as_str(row.get("account_no")) for row in ordered),
+        opening_dates=_opening_dates(ordered),
+    )
+
+
+def build_collusion_view(bundle: PipelineBundle) -> CollusionView:
+    groups = _imei_groups(bundle.accounts) + _branch_groups(bundle.accounts)
+    groups.sort(key=lambda group: (group.basis, group.key))
+    return CollusionView(groups=tuple(groups))
+
+
+@dataclass(frozen=True)
+class TerminalRow:
+    account_no: str
+    terminal_inflow: float
+    cashout_count: int
+    upstream_accounts: tuple[str, ...]
+    terminal_chain_count: int
+
+
+@dataclass(frozen=True)
+class TerminalView:
+    rows: tuple[TerminalRow, ...]    # sorted by (-terminal_inflow, account_no)
+
+
+def build_terminal_view(bundle: PipelineBundle) -> TerminalView:
+    terminal = bundle.transactions.filter(
+        pl.col("payment_mode").is_in(sorted(_TERMINAL_MODES))
+    )
+    if terminal.height == 0:
+        return TerminalView(rows=())
+    grouped = terminal.group_by("receiver_account").agg(
+        pl.col("amount").sum().round(2).alias("inflow"),
+        pl.col("sender_account").unique().sort().alias("senders"),
+    )
+    features = {
+        str(row["account_no"]): row for row in bundle.features.to_dicts()
+    }
+    graph = {str(row["account_no"]): row for row in bundle.graph.to_dicts()}
+    rows: list[TerminalRow] = []
+    for item in grouped.to_dicts():
+        account = as_str(item.get("receiver_account"))
+        senders = item.get("senders")
+        rows.append(TerminalRow(
+            account_no=account,
+            terminal_inflow=as_float(item.get("inflow")),
+            cashout_count=as_int(features.get(account, {}).get("aeps_cashout_inflow_count")),
+            upstream_accounts=tuple(
+                sorted(as_str(sender) for sender in senders)
+            ) if isinstance(senders, list) else (),
+            terminal_chain_count=as_int(
+                graph.get(account, {}).get("terminal_chain_count")
+            ),
+        ))
+    rows.sort(key=lambda row: (-row.terminal_inflow, row.account_no))
+    return TerminalView(rows=tuple(rows))
+
+
+@dataclass(frozen=True)
+class CorrelationRow:
+    ack_a: str
+    state_a: str
+    ack_b: str
+    state_b: str
+    link_basis: str
+    shared_accounts: tuple[str, ...]
+    shared_devices: tuple[str, ...]
+    shared_terminals: tuple[str, ...]
+    interstate: bool
+
+
+@dataclass(frozen=True)
+class CorrelationHotspot:
+    key: str
+    ack_nos: tuple[str, ...]         # sorted
+
+
+@dataclass(frozen=True)
+class CorrelationView:
+    rows: tuple[CorrelationRow, ...]      # sorted by (ack_a, ack_b)
+    hotspots: tuple[CorrelationHotspot, ...]  # sorted by (-len(ack_nos), key)
+
+
+def build_correlation_view(bundle: PipelineBundle) -> CorrelationView:
+    rows = [
+        CorrelationRow(
+            ack_a=link.ack_no_a, state_a=link.state_a,
+            ack_b=link.ack_no_b, state_b=link.state_b,
+            link_basis=link.link_basis,
+            shared_accounts=tuple(sorted(link.shared_accounts)),
+            shared_devices=tuple(sorted(link.shared_device_ids)),
+            shared_terminals=tuple(sorted(link.shared_terminal_accounts)),
+            interstate=link.state_a != link.state_b,
+        )
+        for link in bundle.complaint_links
+    ]
+    rows.sort(key=lambda row: (row.ack_a, row.ack_b))
+    hotspot_acks: dict[str, set[str]] = {}
+    for link in bundle.complaint_links:
+        keys = [*link.shared_accounts, *link.shared_terminal_accounts]
+        for key in keys:
+            hotspot_acks.setdefault(key, set()).update(
+                {link.ack_no_a, link.ack_no_b}
+            )
+    hotspots = [
+        CorrelationHotspot(key=key, ack_nos=tuple(sorted(acks)))
+        for key, acks in hotspot_acks.items()
+    ]
+    hotspots.sort(key=lambda item: (-len(item.ack_nos), item.key))
+    return CorrelationView(rows=tuple(rows), hotspots=tuple(hotspots))
+
+
 __all__ = [
     "AccountDetailView",
+    "CollusionGroup",
+    "CollusionView",
+    "CorrelationHotspot",
+    "CorrelationRow",
+    "CorrelationView",
+    "CycleRow",
+    "CycleView",
+    "GraphEdge",
+    "GraphNode",
+    "GraphView",
     "IngestionTableView",
     "IngestionView",
     "LeaderboardRow",
@@ -453,13 +789,20 @@ __all__ = [
     "MappingRow",
     "PipelineBundle",
     "SubScoreRow",
+    "TerminalRow",
+    "TerminalView",
     "TimelineRow",
     "build_account_detail",
     "build_account_dossier",
     "build_cluster_dossier",
+    "build_collusion_view",
     "build_complaint_dossier",
+    "build_correlation_view",
+    "build_cycle_view",
     "build_dossier_account",
     "build_ingestion_view",
     "build_leaderboard",
+    "build_terminal_view",
+    "build_trail_graph",
     "run_pipeline",
 ]
