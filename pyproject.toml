@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
-prahar-graph = "prahar_graph:main"
+prahar-verify = "simulator.benchmark:main"
 
 [build-system]
 requires = ["uv_build>=0.13.4,<0.14.0"]

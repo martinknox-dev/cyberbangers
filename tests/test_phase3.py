@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -906,6 +908,50 @@ def test_app_upload_branch_builds_a_bundle_from_sample_files() -> None:
     assert any(
         "transactions" in str(item.value).lower() for item in app.subheader
     )
+
+
+def test_prahar_verify_entrypoint_points_at_the_benchmark() -> None:
+    import tomllib
+    from importlib.metadata import entry_points
+
+    root = Path(__file__).resolve().parents[1]
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    assert project["project"]["scripts"] == {
+        "prahar-verify": "simulator.benchmark:main"
+    }
+    installed = {
+        item.name: item.value for item in entry_points(group="console_scripts")
+    }
+    assert installed.get("prahar-verify") == "simulator.benchmark:main"
+
+
+def test_prahar_verify_runs_cleanly_and_reports_the_seeded_benchmark() -> None:
+    import shutil
+
+    root = Path(__file__).resolve().parents[1]
+    executable = shutil.which("prahar-verify") or str(
+        root / ".venv" / "bin" / "prahar-verify"
+    )
+    result = subprocess.run(
+        [executable],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": str(root / "src")},
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    report = result.stdout
+    assert "seed=42" in report
+    assert "Ingestion" in report and "rejected=" in report
+    assert "HIGH" in report and "CRITICAL" in report
+    for scheme in (
+        "rapid_pass_through", "fan_out_smurfing", "aeps_terminal_cash_out",
+        "branch_collusion", "circular_wash",
+    ):
+        assert scheme in report
+    assert "Runtime:" in report
 
 
 def test_trail_graph_routes_complaint_acks_by_membership_not_prefix() -> None:
