@@ -86,8 +86,8 @@ SELECT
     count(*)::BIGINT                                              AS txn_count,
     count(*) FILTER (WHERE direction = 'in')::BIGINT              AS inflow_count,
     count(*) FILTER (WHERE direction = 'out')::BIGINT             AS outflow_count,
-    round(coalesce(sum(amount) FILTER (WHERE direction = 'in'), 0), 2)::DOUBLE  AS inflow_total,
-    round(coalesce(sum(amount) FILTER (WHERE direction = 'out'), 0), 2)::DOUBLE AS outflow_total,
+    round(coalesce(sum(amount) FILTER (WHERE direction = 'in' AND isfinite(amount)), 0), 2)::DOUBLE  AS inflow_total,
+    round(coalesce(sum(amount) FILTER (WHERE direction = 'out' AND isfinite(amount)), 0), 2)::DOUBLE AS outflow_total,
     count(DISTINCT counterparty) FILTER (WHERE direction = 'in')::BIGINT  AS unique_senders,
     count(DISTINCT counterparty) FILTER (WHERE direction = 'out')::BIGINT AS unique_receivers,
     min(t)::BIGINT AS first_ts,
@@ -134,12 +134,13 @@ _SMURF_SQL: Final[str] = """
 WITH bulk AS (
     SELECT account_no, txn_id, t
     FROM legs
-    WHERE direction = 'in' AND amount >= {bulk_threshold}
+    WHERE direction = 'in' AND isfinite(amount) AND amount >= {bulk_threshold}
 ),
 splits AS (
     SELECT account_no, txn_id, t
     FROM legs
     WHERE direction = 'out'
+      AND isfinite(amount)
       AND amount >= {split_min}
       AND amount <= {split_max}
 ),
@@ -179,6 +180,7 @@ _LARGE_PAYOUT_SQL: Final[str] = """
 SELECT account_no, count(*)::BIGINT AS large_payout_count
 FROM legs
 WHERE direction = 'out'
+  AND isfinite(amount)
   AND amount >= {bulk_threshold}
   AND payment_mode IN ('IMPS', 'RTGS', 'NEFT')
 GROUP BY account_no
@@ -200,6 +202,7 @@ WITH win AS (
         ) AS window_start
     FROM legs
     WHERE direction = 'in'
+      AND isfinite(amount)
 ),
 ranked AS (
     SELECT

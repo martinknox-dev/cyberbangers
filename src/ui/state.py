@@ -253,6 +253,8 @@ def _row_for(frame: pl.DataFrame, account_no: str) -> Mapping[str, object] | Non
 def _legs_for(
     transactions: pl.DataFrame, account_no: str
 ) -> tuple[dict[str, object], ...]:
+    if transactions.height == 0 or "sender_account" not in transactions.columns:
+        return ()
     legs = transactions.filter(
         (pl.col("sender_account") == account_no)
         | (pl.col("receiver_account") == account_no)
@@ -263,6 +265,8 @@ def _legs_for(
 def _complaints_for(
     complaints: pl.DataFrame, account_no: str
 ) -> tuple[dict[str, object], ...]:
+    if complaints.height == 0 or "victim_account" not in complaints.columns:
+        return ()
     matched = complaints.filter(
         (pl.col("victim_account") == account_no)
         | (pl.col("suspect_account") == account_no)
@@ -274,7 +278,7 @@ def _imei_peers(
     accounts: pl.DataFrame, master: Mapping[str, object] | None
 ) -> tuple[dict[str, object], ...]:
     imei = as_str((master or {}).get("imei"))
-    if not imei or accounts.height == 0:
+    if not imei or accounts.height == 0 or "imei" not in accounts.columns:
         return ()
     peers = accounts.filter(
         (pl.col("imei") == imei)
@@ -286,11 +290,11 @@ def _imei_peers(
 def _branch_peers(
     accounts: pl.DataFrame, master: Mapping[str, object] | None
 ) -> tuple[dict[str, object], ...]:
-    if master is None:
+    if master is None or accounts.height == 0 or "branch_code" not in accounts.columns:
         return ()
     branch = as_str(master.get("branch_code"))
     opened = as_date(master.get("account_opening_date"))
-    if not branch or opened is None or accounts.height == 0:
+    if not branch or opened is None:
         return ()
     peers: list[tuple[float, dict[str, object]]] = []
     for row in accounts.filter(pl.col("branch_code") == branch).to_dicts():
