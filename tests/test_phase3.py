@@ -917,12 +917,14 @@ def test_prahar_verify_entrypoint_points_at_the_benchmark() -> None:
     root = Path(__file__).resolve().parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     assert project["project"]["scripts"] == {
-        "prahar-verify": "simulator.benchmark:main"
+        "prahar-verify": "simulator.benchmark:main",
+        "prahar-batch": "cli.batch:batch",
     }
     installed = {
         item.name: item.value for item in entry_points(group="console_scripts")
     }
     assert installed.get("prahar-verify") == "simulator.benchmark:main"
+    assert installed.get("prahar-batch") == "cli.batch:batch"
 
 
 def test_prahar_verify_runs_cleanly_and_reports_the_seeded_benchmark() -> None:

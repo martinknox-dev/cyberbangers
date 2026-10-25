@@ -24,6 +24,7 @@ dependencies = [
 
 [project.scripts]
 prahar-verify = "simulator.benchmark:main"
+prahar-batch = "cli.batch:batch"
 
 [build-system]
 requires = ["uv_build>=0.13.4,<0.14.0"]
