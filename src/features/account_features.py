@@ -23,6 +23,7 @@ import polars as pl
 
 from core.contracts import ACCOUNT_FEATURE_SCHEMA, FeatureConfig
 from core.hardware import detect_hardware_profile
+from features.temporal import compute_temporal_features
 
 _EMPTY_FRAME: Final[pl.DataFrame] = pl.DataFrame(schema=ACCOUNT_FEATURE_SCHEMA)
 
@@ -467,6 +468,9 @@ def extract_account_features(
     finally:
         connection.close()
 
+    # Compute temporal features
+    temporal = compute_temporal_features(tx)
+
     frame = universe
     for part in (
         base,
@@ -479,6 +483,7 @@ def extract_account_features(
         branch_cohort,
         terminal,
         complaints_linked,
+        temporal,
     ):
         if part.height:
             frame = frame.join(part, on="account_no", how="left")

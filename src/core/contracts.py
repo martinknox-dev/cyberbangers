@@ -180,6 +180,11 @@ ACCOUNT_FEATURE_SCHEMA: dict[str, pl.DataType] = {
     "smurf_utrs": pl.List(pl.String()),
     "first_txn_timestamp": pl.Datetime("us"),
     "last_txn_timestamp": pl.Datetime("us"),
+    "night_txn_ratio": pl.Float64(),
+    "peak_hour": pl.Int64(),
+    "velocity_txns_per_hour": pl.Float64(),
+    "dow_concentration": pl.Float64(),
+    "active_days": pl.Int64(),
 }
 
 GRAPH_INDICATOR_SCHEMA: dict[str, pl.DataType] = {
