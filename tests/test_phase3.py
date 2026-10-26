@@ -678,12 +678,19 @@ def test_app_benchmark_load_populates_ingestion_metrics() -> None:
     metrics = {
         item.label: int(str(item.value).replace(",", ""))
         for item in app.metric
+        if item.label in {
+            "Total Records", "Accepted & Normalized", "Quarantined (Rejected)", "Tables Loaded",
+            "Rows total", "Accepted", "Rejected",
+        }
     }
     # the seeded benchmark is ingested, so Tab 1 shows real numbers
-    assert metrics["Rows total"] > 0
-    assert metrics["Accepted"] > 0
-    assert metrics["Rejected"] >= 3
-    assert metrics["Rows total"] == metrics["Accepted"] + metrics["Rejected"]
+    total = metrics.get("Total Records") or metrics.get("Rows total", 0)
+    accepted = metrics.get("Accepted & Normalized") or metrics.get("Accepted", 0)
+    rejected = metrics.get("Quarantined (Rejected)") or metrics.get("Rejected", 0)
+    assert total > 0
+    assert accepted > 0
+    assert rejected >= 3
+    assert total == accepted + rejected
 
 
 def test_benchmark_load_returns_ingestion_reports() -> None:
@@ -902,9 +909,16 @@ def test_app_upload_branch_builds_a_bundle_from_sample_files() -> None:
     metrics = {
         item.label: int(str(item.value).replace(",", ""))
         for item in app.metric
+        if item.label in {
+            "Total Records", "Accepted & Normalized", "Quarantined (Rejected)", "Tables Loaded",
+            "Rows total", "Accepted", "Rejected",
+        }
     }
-    assert metrics["Rejected"] == 5
-    assert metrics["Rows total"] == metrics["Accepted"] + metrics["Rejected"]
+    rejected = metrics.get("Quarantined (Rejected)") or metrics.get("Rejected", 0)
+    total = metrics.get("Total Records") or metrics.get("Rows total", 0)
+    accepted = metrics.get("Accepted & Normalized") or metrics.get("Accepted", 0)
+    assert rejected == 5
+    assert total == accepted + rejected
     assert any(
         "transactions" in str(item.value).lower() for item in app.subheader
     )
@@ -987,3 +1001,47 @@ def test_app_selection_lists_are_disclosed_and_manual_entry_works() -> None:
     assert not app.exception, [str(item) for item in app.exception]
     warnings = " ".join(str(item.value) for item in app.warning)
     assert "No trail found" in warnings
+
+
+def test_app_phase5_ui_controls_and_leaderboard_columns() -> None:
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_file(str(APP_PATH), default_timeout=300)
+    app.run()
+    assert not app.exception, [str(item) for item in app.exception]
+
+    # Verify compute tier selector exists and can be set to WORKSTATION
+    assert app.selectbox(key="compute_tier")
+    app.selectbox(key="compute_tier").select("WORKSTATION")
+
+    # Load benchmark with selected compute tier
+    app.button(key="load_benchmark").click().run()
+    assert not app.exception, [str(item) for item in app.exception]
+
+    # Verify sort by selector exists and can toggle to Freeze Priority
+    assert app.selectbox(key="sort_by")
+    app.selectbox(key="sort_by").select("Freeze Priority (Recoverable ₹)").run()
+    assert not app.exception, [str(item) for item in app.exception]
+
+    # Verify role filter selector exists
+    assert app.selectbox(key="filter_role")
+
+    # Verify leaderboard dataframe contains the new Phase 5 columns
+    leaderboard_dfs = [df.value for df in app.dataframe]
+    assert leaderboard_dfs, "No dataframes found in app"
+    leaderboard_data = None
+    for df in leaderboard_dfs:
+        if isinstance(df, list) and df and "Account" in df[0]:
+            leaderboard_data = df
+            break
+        elif hasattr(df, "columns") and "Account" in df.columns:
+            leaderboard_data = df.to_dict(orient="records") if hasattr(df, "to_dict") else df
+            break
+    assert leaderboard_data is not None, "Leaderboard dataframe not found"
+    first_row = leaderboard_data[0] if isinstance(leaderboard_data, list) else {col: leaderboard_data[col][0] for col in leaderboard_data}
+    required_cols = {
+        "Account", "Risk Score", "Band", "Role", "Freeze Priority",
+        "Retained Tainted (₹)", "Domain", "ML Anomaly", "Complaints", "Top Indicator",
+    }
+    assert required_cols.issubset(first_row.keys()), f"Missing columns: {required_cols - set(first_row.keys())}"
+
